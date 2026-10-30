@@ -1,6 +1,7 @@
 package rule
 
 import (
+	"math"
 	"strconv"
 	"strings"
 )
@@ -8,6 +9,9 @@ import (
 // Values supplies operand values. cur is the latest value, prev the value one
 // step earlier (needed by cross_up/cross_down). ok=false means unavailable.
 // Eval resolves constant operands itself and only calls Get for functions.
+// A NaN or +/-Inf value returned with ok=true is treated as unavailable: any
+// leaf whose operator uses it (cur only for comparisons, cur and prev for
+// crossovers) evaluates to Unknown.
 type Values interface {
 	Get(o Operand) (cur, prev float64, ok bool)
 }
@@ -94,6 +98,15 @@ func evalLeaf(l Leaf, v Values) Result {
 	if !ok1 || !ok2 {
 		return Unknown
 	}
+	needed := []float64{ca, cb}
+	if l.Op == OpCrossUp || l.Op == OpCrossDown {
+		needed = append(needed, pa, pb)
+	}
+	for _, x := range needed {
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return Unknown
+		}
+	}
 	switch l.Op {
 	case OpGT:
 		return b2r(ca > cb)
@@ -137,7 +150,8 @@ func describeOperand(o Operand, cur float64) string {
 
 // Describe renders every leaf that evaluates True, in tree order, joined by
 // "; " (e.g. "rsi(14)=27.31 < 30"). Constants render as the bare number.
-// Leaves under Not, and False/Unknown leaves, are omitted.
+// Leaves under Not, and False/Unknown leaves, are omitted. Under Any only
+// children that evaluate True are described. Call it when Eval(n, v) == True.
 func Describe(n Node, v Values) string {
 	var parts []string
 	var walk func(Node)
@@ -149,7 +163,9 @@ func Describe(n Node, v Values) string {
 			}
 		case Any:
 			for _, c := range t.Children {
-				walk(c)
+				if Eval(c, v) == True {
+					walk(c)
+				}
 			}
 		case Leaf:
 			if evalLeaf(t, v) != True {

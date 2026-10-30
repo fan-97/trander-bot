@@ -1,6 +1,9 @@
 package rule
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // mapValues is a test Values keyed by Operand.String(); value is {cur, prev}.
 // A missing key yields ok=false.
@@ -37,9 +40,6 @@ func TestEval_Comparisons(t *testing.T) {
 		if got := Eval(l, v); got != c.want {
 			t.Errorf("%s = %v, want %v", c.expr, got, c.want)
 		}
-	}
-	if Eval(leaf(t, "rsi(14) > 29"), v) != True {
-		t.Fatal("sanity")
 	}
 	// constant on the left is resolved by Eval, not Values.
 	if got := Eval(leaf(t, "20 < rsi(14)"), v); got != True {
@@ -194,3 +194,32 @@ func TestDescribe(t *testing.T) {
 }
 
 func fp(f float64) *float64 { return &f }
+
+func TestEval_NaNInfUnknown(t *testing.T) {
+	nan, inf := math.NaN(), math.Inf(1)
+	if got := Eval(Not{leaf(t, "rsi(14) < 30")}, mapValues{"rsi(14)": {nan, 50}}); got != Unknown {
+		t.Errorf("not NaN: %v", got)
+	}
+	if got := Eval(leaf(t, "rsi(14) < 30"), mapValues{"rsi(14)": {inf, 1}}); got != Unknown {
+		t.Errorf("Inf cur: %v", got)
+	}
+	cu := leaf(t, "cross_up(ema(12), ema(26))")
+	if got := Eval(cu, mapValues{"ema(12)": {5, inf}, "ema(26)": {4, 4}}); got != Unknown {
+		t.Errorf("cross Inf prev: %v", got)
+	}
+	// prev is unused by plain comparisons
+	if got := Eval(leaf(t, "rsi(14) < 30"), mapValues{"rsi(14)": {20, nan}}); got != True {
+		t.Errorf("NaN prev on comparison: %v", got)
+	}
+}
+
+func TestDescribe_AnyOnlyTrueBranches(t *testing.T) {
+	v := mapValues{"close": {10, 9}, "rsi(14)": {20, 20}}
+	n := Any{[]Node{
+		All{[]Node{leaf(t, "close > 5"), leaf(t, "rsi(14) > 50")}},
+		leaf(t, "rsi(14) < 30"),
+	}}
+	if got, want := Describe(n, v), "rsi(14)=20 < 30"; got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
