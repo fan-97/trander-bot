@@ -155,13 +155,12 @@ func (r *rawConfig) build() (*Config, error) {
 			}
 			r2.Cooldown = d
 		}
-		if w := &rr.When; !(w.IsZero() || w.Tag == "!!null" || (w.Kind == yaml.ScalarNode && w.Value == "")) {
-			n, err := rule.Parse(w)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("rule %q: when: %w", rr.ID, err))
-			} else {
-				r2.When = n
-			}
+		if w := &rr.When; w.IsZero() || w.Tag == "!!null" || (w.Kind == yaml.ScalarNode && w.Value == "") {
+			errs = append(errs, fmt.Errorf("rule %q: missing when", rr.ID))
+		} else if n, err := rule.Parse(w); err != nil {
+			errs = append(errs, fmt.Errorf("rule %q: when: %w", rr.ID, err))
+		} else {
+			r2.When = n
 		}
 		c.Rules = append(c.Rules, r2)
 	}

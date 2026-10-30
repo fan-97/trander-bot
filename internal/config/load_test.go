@@ -130,6 +130,9 @@ func TestValidate_BadExpression(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
+	if strings.Contains(err.Error(), "missing when") {
+		t.Errorf("spurious missing when: %v", err)
+	}
 	for _, w := range []string{`rule "a"`, "foo(1) > 2", `rule "b"`, "rsi(14) <", "line 4"} {
 		if !strings.Contains(err.Error(), w) {
 			t.Errorf("err lacks %q: %v", w, err)

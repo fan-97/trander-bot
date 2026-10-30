@@ -250,7 +250,7 @@ func (p *parser) leaf() (Leaf, error) {
 	if p.tok.kind != tEOF {
 		return Leaf{}, p.errf(p.tok.pos, "unexpected %s after expression", p.describe())
 	}
-	return finish(Leaf{Left: left, Op: op, Right: right}, 0)
+	return finish(Leaf{Left: left, Op: op, Right: right})
 }
 
 func (p *parser) expect(k tokKind, what string) error {
@@ -288,11 +288,11 @@ func (p *parser) cross() (Leaf, error) {
 	if p.tok.kind != tEOF {
 		return Leaf{}, p.errf(p.tok.pos, "unexpected %s after expression", p.describe())
 	}
-	return finish(Leaf{Left: left, Op: op, Right: right}, 0)
+	return finish(Leaf{Left: left, Op: op, Right: right})
 }
 
 // finish validates leaf-level rules: at least one side must be a function.
-func finish(l Leaf, _ int) (Leaf, error) {
+func finish(l Leaf) (Leaf, error) {
 	if l.Left.Func == "" && l.Right.Func == "" {
 		return Leaf{}, errors.New("at least one side must be an indicator or data function, not two constants")
 	}

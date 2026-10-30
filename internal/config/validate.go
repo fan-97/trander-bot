@@ -76,9 +76,6 @@ func (c *Config) Validate() error {
 		if r.Cooldown < 0 {
 			add("rule %q: negative cooldown", r.ID)
 		}
-		if r.When == nil {
-			add("rule %q: missing when", r.ID)
-		}
 		if len(r.Channels) == 0 {
 			add("rule %q: no channels", r.ID)
 		}
