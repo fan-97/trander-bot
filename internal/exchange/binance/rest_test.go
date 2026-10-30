@@ -346,6 +346,7 @@ func TestREST_429TwiceFailsAndOtherErrorsNotRetried(t *testing.T) {
 
 	calls.Store(0)
 	status.Store(http.StatusBadRequest)
+	clk.Advance(time.Second) // the second 429 paused all callers for Retry-After
 	if _, err := r.OpenInterest(context.Background(), "X"); err == nil || calls.Load() != 1 {
 		t.Fatalf("400: err %v calls %d", err, calls.Load())
 	}
@@ -409,5 +410,45 @@ func TestPollContract_EmitsAndSkipsFailingSymbol(t *testing.T) {
 	case <-errc:
 	case <-time.After(2 * time.Second):
 		t.Fatal("PollContract did not stop")
+	}
+}
+
+func TestKlinesWeight_Table(t *testing.T) {
+	for _, c := range []struct{ limit, want int }{{1, 1}, {99, 1}, {100, 2}, {499, 2}, {500, 5}, {1000, 5}, {1001, 10}, {1500, 10}} {
+		if got := klinesWeight(c.limit); got != c.want {
+			t.Errorf("klinesWeight(%d) = %d, want %d", c.limit, got, c.want)
+		}
+	}
+}
+
+func TestREST_429PausesAllCallers(t *testing.T) {
+	clk := clock.NewFake(t0)
+	var calls atomic.Int32
+	first := make(chan struct{})
+	r := newTestREST(t, func(w http.ResponseWriter, req *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "10")
+			w.WriteHeader(http.StatusTeapot)
+			close(first)
+			return
+		}
+		fmt.Fprint(w, `{"openInterest":"1","time":1}`)
+	}, 1200, clk)
+	go r.OpenInterest(context.Background(), "A")
+	<-first
+	time.Sleep(20 * time.Millisecond) // let the first caller record the pause
+	done := make(chan struct{})
+	go func() { defer close(done); r.OpenInterest(context.Background(), "B") }()
+	select {
+	case <-done:
+		t.Fatal("second caller not paused by the other caller's 418")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls during pause = %d", calls.Load())
+	}
+	waitDone(t, clk, time.Second, done)
+	if el := clk.Now().Sub(t0); el < 10*time.Second {
+		t.Fatalf("second caller ran after only %v", el)
 	}
 }

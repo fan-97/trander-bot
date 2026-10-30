@@ -35,8 +35,15 @@ func TestLoad_Example(t *testing.T) {
 	if len(c.Intervals) != 2 || c.Intervals[0] != market.I5m {
 		t.Errorf("intervals=%v", c.Intervals)
 	}
-	if c.Binance.RESTURL != "https://fapi.binance.com" {
+	if c.Binance.RESTURL != "https://fapi.binance.com" || c.Binance.WSURL != "wss://fstream.binance.com/market" {
 		t.Errorf("binance=%+v", c.Binance)
+	}
+}
+
+func TestDefaultWSURLHasMarketPath(t *testing.T) {
+	// The root path connects but Binance sends no market data on it.
+	if defaultWSURL != "wss://fstream.binance.com/market" {
+		t.Fatalf("defaultWSURL = %q", defaultWSURL)
 	}
 }
 

@@ -17,7 +17,7 @@ const (
 	defaultMergeWindow   = 10 * time.Second
 	defaultRatePerMinute = 20
 	defaultRESTURL       = "https://fapi.binance.com"
-	defaultWSURL         = "wss://fstream.binance.com"
+	defaultWSURL         = "wss://fstream.binance.com/market"
 )
 
 type rawConfig struct {

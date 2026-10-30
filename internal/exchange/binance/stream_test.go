@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -448,4 +450,165 @@ func TestStream_ResubscribesOnChange(t *testing.T) {
 	}
 	h.state(false)
 	h.state(true)
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
+func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+// eventAdvancing returns the next event, advancing the fake clock meanwhile
+// so retry waits elapse.
+func (h *harness) eventAdvancing(step time.Duration) market.Event {
+	h.t.Helper()
+	limit := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-h.out:
+			return ev
+		case <-limit:
+			h.t.Fatal("no event")
+			return nil
+		case <-time.After(2 * time.Millisecond):
+			h.clk.Advance(step)
+		}
+	}
+}
+
+// holeHarness: connected, last closed bar 11:59 emitted, clock then moved to
+// 12:03:30 with the connection kept up (watchdog disabled).
+func holeHarness(t *testing.T, rest http.HandlerFunc, seed bool) (*harness, *srvConn) {
+	m := t0.Truncate(time.Minute)
+	h := newHarness(t, rest, "BTCUSDT")
+	h.s.readTimeout = 48 * time.Hour
+	if seed {
+		h.s.Seed("BTCUSDT", m.Add(-time.Minute))
+	}
+	h.run()
+	sc := h.ws.next(t)
+	h.state(true)
+	if !seed {
+		sc.send(t, klineMsg("BTCUSDT", m.Add(-time.Minute), true, 0))
+		wantKline(t, h.event(), m.Add(-time.Minute), true)
+	}
+	h.clk.Advance(3 * time.Minute)
+	return h, sc
+}
+
+func holeRows(w http.ResponseWriter) {
+	m := t0.Truncate(time.Minute)
+	fmt.Fprintf(w, "[%s,%s]", klineRow(m, 1), klineRow(m.Add(time.Minute), 2))
+}
+
+func TestStream_HoleFillRetriesThenSucceeds(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		if q := r.URL.Query(); q.Get("startTime") != fmt.Sprint(m.UnixMilli()) {
+			t.Errorf("startTime %s", q.Get("startTime"))
+		}
+		holeRows(w)
+	}, false)
+	sc.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3)) // 12:00, 12:01 missing
+	wantKline(t, h.eventAdvancing(500*time.Millisecond), m, true)
+	wantKline(t, h.event(), m.Add(time.Minute), true)
+	wantKline(t, h.event(), m.Add(2*time.Minute), true)
+	h.noEvent()
+	if calls.Load() != 2 {
+		t.Fatalf("rest calls %d", calls.Load())
+	}
+}
+
+func TestStream_HoleFillGivesUpLogsErrorEmitsLive(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}, false)
+	var logs syncBuf
+	h.s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	start := h.clk.Now()
+	sc.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3))
+	wantKline(t, h.eventAdvancing(500*time.Millisecond), m.Add(2*time.Minute), true)
+	if calls.Load() != 4 {
+		t.Fatalf("attempts %d, want 4 (1 + 3 retries)", calls.Load())
+	}
+	if el := h.clk.Now().Sub(start); el < 7*time.Second {
+		t.Fatalf("retries waited only %v", el)
+	}
+	if l := logs.String(); !strings.Contains(l, "level=ERROR") || !strings.Contains(l, "symbol=BTCUSDT") {
+		t.Fatalf("no error log: %s", l)
+	}
+	// The hole is accepted; the next bar is not blocked.
+	sc.send(t, klineMsg("BTCUSDT", m.Add(3*time.Minute), true, 4))
+	wantKline(t, h.event(), m.Add(3*time.Minute), true)
+}
+
+func TestStream_SeedThenLiveBarFillsHole(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		holeRows(w)
+	}, true)
+	sc.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3))
+	wantKline(t, h.event(), m, true)
+	wantKline(t, h.event(), m.Add(time.Minute), true)
+	wantKline(t, h.event(), m.Add(2*time.Minute), true)
+	h.noEvent()
+	if calls.Load() != 1 {
+		t.Fatalf("rest calls %d", calls.Load())
+	}
+}
+
+func TestStream_GapFillSkipsBarsNotSafelyClosed(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		// REST itself would mark 12:02 closed at 12:03:01.
+		fmt.Fprintf(w, "[%s,%s,%s]", klineRow(m, 1), klineRow(m.Add(time.Minute), 2), klineRow(m.Add(2*time.Minute), 3))
+	}, "BTCUSDT")
+	h.run()
+	sc1 := h.ws.next(t)
+	h.state(true)
+	sc1.send(t, klineMsg("BTCUSDT", m.Add(-time.Minute), true, 0))
+	wantKline(t, h.event(), m.Add(-time.Minute), true)
+	sc1.c.CloseNow()
+	h.state(false)
+	h.clk.Advance(2*time.Minute + 31*time.Second) // now 12:03:01
+	sc2 := h.ws.next(t)
+	h.state(true)
+	wantKline(t, h.event(), m, true)
+	wantKline(t, h.event(), m.Add(time.Minute), true)
+	h.noEvent() // 12:02 ended only 1s ago: left to the live stream
+	sc2.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3))
+	wantKline(t, h.event(), m.Add(2*time.Minute), true)
+	if calls.Load() != 1 {
+		t.Fatalf("rest calls %d", calls.Load())
+	}
+}
+
+func TestNewStream_WarnsOnEmptyPath(t *testing.T) {
+	var logs syncBuf
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prev)
+	NewStream("wss://fstream.binance.com", nil, nil, nil)
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("no warning for empty path: %q", logs.String())
+	}
+	logs = syncBuf{}
+	NewStream(DefaultWSURL, nil, nil, nil)
+	if logs.String() != "" {
+		t.Fatalf("unexpected log: %q", logs.String())
+	}
 }

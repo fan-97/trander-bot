@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,12 +27,18 @@ const (
 	// accepted ~5.5KB (90 symbols) but dropped the handshake at ~6.2KB
 	// (100 symbols), so stay well below.
 	maxURLLen = 4000
-	// maxGapFill bounds one gap-fill request (about a day of 1m bars).
-	maxGapFill = maxKlinesPerRequest
+	// closeMargin: a REST bar counts as closed for gap fill only if it ended
+	// at least this long before the request, so a partial bar is never
+	// emitted as Closed.
+	closeMargin = 2 * time.Second
 )
 
 // Stream maintains Binance combined-stream connections for a symbol pool and
 // turns them into market events. See Run.
+//
+// onState flaps false→true on every symbol-pool change (all connections are
+// rebuilt) and reports false on shutdown, so consumers that alert on
+// disconnects must debounce (e.g. only alert after a minute down).
 type Stream struct {
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
@@ -65,6 +72,9 @@ type Stream struct {
 func NewStream(wsURL string, rest *REST, clk clock.Clock, onState func(connected bool)) *Stream {
 	if clk == nil {
 		clk = clock.Real{}
+	}
+	if u, err := url.Parse(wsURL); err != nil || u.Path == "" || u.Path == "/" {
+		slog.Default().Warn("binance stream: ws URL has no path; Binance accepts such connections but sends no data — use "+DefaultWSURL, "ws_url", wsURL)
 	}
 	return &Stream{
 		wsURL:       wsURL,
@@ -121,6 +131,18 @@ func (s *Stream) Run(ctx context.Context, symbols func() []string, changed <-cha
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+}
+
+// Seed records lastClosed as the OpenTime of the last closed 1m bar of symbol
+// already known to the caller (e.g. from warmup), so the next closed live bar
+// triggers a fill of anything missing in between. An older value is ignored.
+func (s *Stream) Seed(symbol string, lastClosed time.Time) {
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if last, ok := s.lastClosed[sym]; !ok || lastClosed.After(last) {
+		s.lastClosed[sym] = lastClosed
 	}
 }
 
@@ -378,40 +400,79 @@ func (s *Stream) serve(ctx context.Context, cur *conn, u string, rotate, watch <
 	}
 }
 
-// gapFill emits the closed 1m bars missed since the last emitted closed bar
-// of each symbol. Symbols never seen need nothing.
+// gapFill runs after each (re)connect: for every symbol with a known last
+// closed bar it emits the bars that closed safely (closeMargin) before now.
+// One attempt only; a failure is caught later by hole detection in forward.
 func (s *Stream) gapFill(ctx context.Context, syms []string, out chan<- market.Event) {
 	if s.rest == nil {
 		return
 	}
+	until := s.clk.Now().Add(-closeMargin)
 	for _, sym := range syms {
 		s.emitMu.Lock()
-		last, ok := s.lastClosed[sym]
+		if _, ok := s.lastClosed[sym]; ok {
+			if err := s.fillLocked(ctx, sym, until, out); err != nil && ctx.Err() == nil {
+				s.log().Warn("binance stream: reconnect gap fill failed", "symbol", sym, "err", err)
+			}
+		}
 		s.emitMu.Unlock()
-		if !ok {
-			continue
+	}
+}
+
+// fillLocked emits, in order, the closed 1m bars of sym after its last closed
+// bar that ended at or before until, fetched over REST. It returns an error
+// if the REST call fails or the range is not completely covered. emitMu must
+// be held.
+func (s *Stream) fillLocked(ctx context.Context, sym string, until time.Time, out chan<- market.Event) error {
+	start := s.lastClosed[sym].Add(time.Minute)
+	n := int(until.Sub(start) / time.Minute) // bars ending at or before until
+	if n <= 0 {
+		return nil
+	}
+	ks, err := s.rest.Klines(ctx, sym, market.I1m, start, n)
+	if err != nil {
+		return err
+	}
+	for _, k := range ks {
+		last := s.lastClosed[sym]
+		if k.Closed && k.OpenTime.After(last) && !k.OpenTime.Add(time.Minute).After(until) {
+			s.emitLocked(ctx, market.KlineEvent{Kline: k}, out)
 		}
-		start := last.Add(time.Minute)
-		n := int(s.clk.Now().Sub(start)/time.Minute) + 1
-		if n <= 0 {
-			continue
+	}
+	if got := s.lastClosed[sym]; got.Add(time.Minute).Before(start.Add(time.Duration(n) * time.Minute)) {
+		return fmt.Errorf("incomplete: filled up to %s of %s", got.Add(time.Minute).Format(time.RFC3339),
+			start.Add(time.Duration(n)*time.Minute).Format(time.RFC3339))
+	}
+	return nil
+}
+
+// holeRetryWaits are the waits between hole-fill attempts.
+var holeRetryWaits = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+
+// fillHoleLocked fills the bars between the last closed bar of sym and a live
+// closed bar opening at next, retrying with holeRetryWaits. If every attempt
+// fails the hole is logged at Error and accepted, so live data never stalls.
+// emitMu must be held.
+func (s *Stream) fillHoleLocked(ctx context.Context, sym string, next time.Time, out chan<- market.Event) {
+	from := s.lastClosed[sym].Add(time.Minute)
+	var err error
+	for attempt := 0; ; attempt++ {
+		if s.rest == nil {
+			err = errors.New("no REST client")
+			break
 		}
-		if n > maxGapFill {
-			s.log().Warn("binance stream: gap too long, filling only the start", "symbol", sym, "bars", n)
-			n = maxGapFill
+		if err = s.fillLocked(ctx, sym, next, out); err == nil || ctx.Err() != nil || attempt >= len(holeRetryWaits) {
+			break
 		}
-		ks, err := s.rest.Klines(ctx, sym, market.I1m, start, n)
-		if err != nil {
-			if ctx.Err() == nil {
-				s.log().Warn("binance stream: gap fill failed", "symbol", sym, "err", err)
-			}
-			continue
+		s.log().Warn("binance stream: hole fill failed, retrying", "symbol", sym, "err", err, "retry_in", holeRetryWaits[attempt])
+		select {
+		case <-ctx.Done():
+		case <-s.clk.After(holeRetryWaits[attempt]):
 		}
-		for _, k := range ks {
-			if k.Closed {
-				s.forward(ctx, market.KlineEvent{Kline: k}, out)
-			}
-		}
+	}
+	if err != nil && ctx.Err() == nil {
+		s.log().Error("binance stream: could not fill missing 1m bars, continuing with live data",
+			"symbol", sym, "from", from, "to", next.Add(-time.Minute), "err", err)
 	}
 }
 
@@ -427,8 +488,10 @@ func (s *Stream) handle(ctx context.Context, b []byte, out chan<- market.Event) 
 }
 
 // forward sends ev unless it is a kline at or before the last emitted closed
-// bar of its symbol. Sends are serialized so ordering holds across
-// connections overlapping during rotation.
+// bar of its symbol. A closed bar that skips ahead of last+1m first gets the
+// hole filled over REST (see fillHoleLocked). Sends are serialized so
+// ordering holds across connections overlapping during rotation; a hole fill
+// therefore holds back events of other connections until it finishes.
 func (s *Stream) forward(ctx context.Context, ev market.Event, out chan<- market.Event) {
 	s.emitMu.Lock()
 	defer s.emitMu.Unlock()
@@ -440,9 +503,17 @@ func (s *Stream) forward(ctx context.Context, ev market.Event, out chan<- market
 		if seen && !k.OpenTime.After(last) {
 			return
 		}
-		if k.Closed {
-			s.lastClosed[k.Symbol] = k.OpenTime
+		if seen && k.Closed && k.OpenTime.After(last.Add(time.Minute)) {
+			s.fillHoleLocked(ctx, k.Symbol, k.OpenTime, out)
 		}
+	}
+	s.emitLocked(ctx, ev, out)
+}
+
+// emitLocked sends ev and records closed 1m bars. emitMu must be held.
+func (s *Stream) emitLocked(ctx context.Context, ev market.Event, out chan<- market.Event) {
+	if k, ok := ev.(market.KlineEvent); ok && k.Closed {
+		s.lastClosed[k.Symbol] = k.OpenTime
 	}
 	select {
 	case out <- ev:

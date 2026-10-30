@@ -50,4 +50,4 @@ database:
 
 binance:
   rest_url: https://fapi.binance.com
-  ws_url: wss://fstream.binance.com
+  ws_url: wss://fstream.binance.com/market

@@ -84,6 +84,17 @@ type bucket struct {
 	tokens   float64
 	last     time.Time
 	started  bool
+	// pauseUntil blocks every caller after a 429/418 until Retry-After ends.
+	pauseUntil time.Time
+}
+
+// pause makes all acquires wait until t (a later pause wins).
+func (b *bucket) pause(t time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if t.After(b.pauseUntil) {
+		b.pauseUntil = t
+	}
 }
 
 func (b *bucket) refill(now time.Time) {
@@ -108,7 +119,18 @@ func (b *bucket) acquire(ctx context.Context, clk clock.Clock, weight int) error
 	}
 	for {
 		b.mu.Lock()
-		b.refill(clk.Now())
+		now := clk.Now()
+		if now.Before(b.pauseUntil) {
+			wait := b.pauseUntil.Sub(now)
+			b.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-clk.After(wait):
+			}
+			continue
+		}
+		b.refill(now)
 		if b.tokens >= w {
 			b.tokens -= w
 			b.mu.Unlock()
@@ -145,12 +167,13 @@ func (b *bucket) observe(clk clock.Clock, used int) {
 	}
 }
 
-// klinesWeight is the request weight for a klines call with the given limit.
+// klinesWeight is the documented request weight for a klines call:
+// [1,100) 1, [100,500) 2, [500,1000] 5, >1000 10.
 func klinesWeight(limit int) int {
 	switch {
-	case limit <= 100:
+	case limit < 100:
 		return 1
-	case limit <= 500:
+	case limit < 500:
 		return 2
 	case limit <= 1000:
 		return 5
@@ -172,23 +195,24 @@ func (e *StatusError) Error() string {
 }
 
 // get performs a rate-limited GET and decodes the JSON body into out.
-// HTTP 429/418 is retried once after Retry-After (default 60s).
+// HTTP 429/418 pauses every caller for Retry-After (default 60s; a 418 is an
+// IP ban) and this call is retried once after the pause.
 func (r *REST) get(ctx context.Context, path string, q url.Values, weight int, out any) error {
 	for attempt := 0; ; attempt++ {
 		err := r.getOnce(ctx, path, q, weight, out)
 		var se *StatusError
-		if attempt > 0 || !errors.As(err, &se) || (se.Status != http.StatusTooManyRequests && se.Status != http.StatusTeapot) {
+		if !errors.As(err, &se) || (se.Status != http.StatusTooManyRequests && se.Status != http.StatusTeapot) {
 			return err
 		}
 		wait := 60 * time.Second
 		if v, perr := strconv.Atoi(se.retryAfter); perr == nil && v >= 0 {
 			wait = time.Duration(v) * time.Second
 		}
-		r.log().Warn("binance rate limited, backing off", "path", path, "status", se.Status, "wait", wait)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-r.clk().After(wait):
+		r.log().Warn("binance rate limited, pausing all requests", "path", path, "status", se.Status, "wait", wait)
+		// The pause applies to every caller; the retry's acquire waits it out.
+		r.bucket.pause(r.clk().Now().Add(wait))
+		if attempt > 0 {
+			return err
 		}
 	}
 }
