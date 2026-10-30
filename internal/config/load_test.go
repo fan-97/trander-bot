@@ -99,8 +99,8 @@ func TestParse_BuildAndValidateErrorsTogether(t *testing.T) {
 symbols: [BTCUSDT]
 channels: {tg: {type: telegram}}
 rules:
-  - {id: a, interval: 5m, cooldown: abc, when: {all: ["x > 1"]}, channels: [tg]}
-  - {id: a, interval: 5m, when: {all: ["x > 1"]}, channels: [tg]}
+  - {id: a, interval: 5m, cooldown: abc, when: {all: ["rsi(14) < 30"]}, channels: [tg]}
+  - {id: a, interval: 5m, when: {all: ["rsi(14) < 30"]}, channels: [tg]}
 `))
 	if err == nil || !strings.Contains(err.Error(), "invalid cooldown") || !strings.Contains(err.Error(), "duplicate rule id") {
 		t.Fatalf("err=%v", err)
@@ -122,5 +122,17 @@ func TestValidate_WhenNull(t *testing.T) {
 	_, err := Parse([]byte("symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n  - {id: a, interval: 5m, when: null, channels: [tg]}"))
 	if err == nil || !strings.Contains(err.Error(), "missing when") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidate_BadExpression(t *testing.T) {
+	_, err := Parse([]byte("symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n  - {id: a, interval: 5m, when: {all: [\"foo(1) > 2\"]}, channels: [tg]}\n  - {id: b, interval: 5m, when: {all: [\"rsi(14) <\"]}, channels: [tg]}"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, w := range []string{`rule "a"`, "foo(1) > 2", `rule "b"`, "rsi(14) <", "line 4"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("err lacks %q: %v", w, err)
+		}
 	}
 }

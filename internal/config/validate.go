@@ -6,8 +6,6 @@ import (
 	"sort"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"trader-bot/internal/market"
 
 	_ "time/tzdata" // QuietHours TZ validation must work in distroless images
@@ -78,7 +76,7 @@ func (c *Config) Validate() error {
 		if r.Cooldown < 0 {
 			add("rule %q: negative cooldown", r.ID)
 		}
-		if r.When.IsZero() || r.When.Tag == "!!null" || (r.When.Kind == yaml.ScalarNode && r.When.Value == "") {
+		if r.When == nil {
 			add("rule %q: missing when", r.ID)
 		}
 		if len(r.Channels) == 0 {

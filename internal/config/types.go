@@ -4,9 +4,8 @@ package config
 import (
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"trader-bot/internal/market"
+	"trader-bot/internal/rule"
 )
 
 type Level string
@@ -57,7 +56,7 @@ type Rule struct {
 	Symbols  []string // ["all"] means every watched symbol
 	Interval market.Interval
 	Trigger  Trigger
-	When     yaml.Node // Task 5 replaces this with a parsed rule.Node
+	When     rule.Node // parsed condition tree; nil when missing
 	Cooldown time.Duration
 	Channels []string
 	Level    Level

@@ -10,6 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"trader-bot/internal/market"
+	"trader-bot/internal/rule"
 )
 
 const (
@@ -130,32 +131,39 @@ func (r *rawConfig) build() (*Config, error) {
 
 	var errs []error
 	for i, rr := range r.Rules {
-		rule := Rule{
+		r2 := Rule{
 			ID:       rr.ID,
 			Symbols:  []string(rr.Symbols),
 			Interval: market.Interval(rr.Interval),
 			Trigger:  Trigger(rr.Trigger),
-			When:     rr.When,
 			Channels: rr.Channels,
 			Level:    Level(rr.Level),
 		}
-		if len(rule.Symbols) == 0 {
-			rule.Symbols = []string{AllSymbols}
+		if len(r2.Symbols) == 0 {
+			r2.Symbols = []string{AllSymbols}
 		}
-		if rule.Trigger == "" {
-			rule.Trigger = TriggerOnClose
+		if r2.Trigger == "" {
+			r2.Trigger = TriggerOnClose
 		}
-		if rule.Level == "" {
-			rule.Level = LevelWarn
+		if r2.Level == "" {
+			r2.Level = LevelWarn
 		}
 		if rr.Cooldown != "" {
 			d, err := time.ParseDuration(rr.Cooldown)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("rules[%d] %q: invalid cooldown %q: %w", i, rr.ID, rr.Cooldown, err))
 			}
-			rule.Cooldown = d
+			r2.Cooldown = d
 		}
-		c.Rules = append(c.Rules, rule)
+		if w := &rr.When; !(w.IsZero() || w.Tag == "!!null" || (w.Kind == yaml.ScalarNode && w.Value == "")) {
+			n, err := rule.Parse(w)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("rule %q: when: %w", rr.ID, err))
+			} else {
+				r2.When = n
+			}
+		}
+		c.Rules = append(c.Rules, r2)
 	}
 
 	if len(r.Intervals) > 0 {
