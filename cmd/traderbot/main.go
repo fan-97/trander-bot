@@ -40,9 +40,6 @@ import (
 const (
 	// shutdownTimeout bounds the whole graceful shutdown after SIGINT/SIGTERM.
 	shutdownTimeout = 10 * time.Second
-	// warmupTimeout bounds one symbol's history fetch (R16); on timeout the
-	// worker starts cold.
-	warmupTimeout = 90 * time.Second
 	// warmupBars is how many bars per configured interval are fetched.
 	warmupBars = 500
 	// maxWarmup1m caps the extra 1m bars fetched to fill the current bucket
@@ -67,6 +64,14 @@ const (
 
 	statsEvery = time.Minute
 )
+
+// warmupTimeout bounds one symbol's history fetch (R16); on timeout the bars
+// fetched so far are used. A var so tests can shorten it.
+var warmupTimeout = 90 * time.Second
+
+// fatalNotifyTimeout bounds how long a fatal error waits for its system
+// message to be delivered before run returns.
+const fatalNotifyTimeout = 5 * time.Second
 
 // Store is the storage surface run needs: the Writer's sink plus Close.
 type Store interface {
@@ -152,16 +157,24 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	st, err := openStore(ctx, cfg.Database.DSN)
-	if err != nil {
-		return fmt.Errorf("open storage: %w", err)
-	}
-	defer st.Close() // deferred first, so it runs after everything else has stopped
-
 	disp, err := newDispatcher(cfg, deps.HTTPClient, clk)
 	if err != nil {
 		return err
 	}
+	// From here on a fatal error is also pushed to every channel.
+	fatal := func(err error) error {
+		if ctx.Err() == nil {
+			notifyFatal(disp, "启动失败", err, log)
+		}
+		return err
+	}
+
+	st, err := openStore(ctx, cfg.Database.DSN)
+	if err != nil {
+		return fatal(fmt.Errorf("open storage: %w", err))
+	}
+	defer st.Close() // deferred first, so it runs after everything else has stopped
+
 	mon := health.NewMonitor(clk, disp.SendSystem, staleAfter)
 
 	rest := binance.NewREST(cfg.Binance.RESTURL, binance.DefaultWeightPerMin)
@@ -171,11 +184,11 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	}
 	have, err := exchangeSymbols(ctx, rest)
 	if err != nil {
-		return fmt.Errorf("load exchange symbols: %w", err)
+		return fatal(fmt.Errorf("load exchange symbols: %w", err))
 	}
 	active, dropped := filterSymbols(cfg, have)
 	if len(active.Symbols) == 0 {
-		return fmt.Errorf("none of the configured symbols %v is a tradable USDT perpetual", cfg.Symbols)
+		return fatal(fmt.Errorf("none of the configured symbols %v is a tradable USDT perpetual", cfg.Symbols))
 	}
 	if len(dropped) > 0 {
 		log.Warn("ignoring symbols that are not tradable USDT perpetuals", "dropped", dropped)
@@ -186,6 +199,24 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	store := config.NewStore(active) // what the bot runs on: symbols validated
 
 	g, gctx := errgroup.WithContext(ctx)
+	// A signal-driven shutdown is bounded in main; a component failure
+	// cancels gctx without a signal, so bound that shutdown here.
+	var bound atomic.Pointer[time.Timer]
+	stopBound := context.AfterFunc(gctx, func() {
+		if ctx.Err() != nil {
+			return
+		}
+		bound.Store(time.AfterFunc(shutdownTimeout, func() {
+			slog.Error("shutdown after a component failure did not finish in time, exiting", "timeout", shutdownTimeout)
+			os.Exit(1)
+		}))
+	})
+	defer func() {
+		stopBound()
+		if t := bound.Load(); t != nil {
+			t.Stop()
+		}
+	}()
 
 	events := make(chan market.Event, eventBuffer)
 	routerIn := make(chan market.Event, routerBuffer)
@@ -196,7 +227,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	symbols := func() []string { return store.Current().Symbols }
 
 	stream := binance.NewStream(cfg.Binance.WSURL, rest, clk, mon.OnConn)
-	router := engine.NewRouter(store, signal.NewGate(clk), signals, clk, warmup(rest, stream, store, clk, log))
+	router := engine.NewRouter(store, signal.NewGate(clk), signals, clk, warmup(rest, stream, store, clk, mon.Alert, log))
 	batcher := signal.NewBatcher(clk, func() config.NotifyConfig { return store.Current().Notify }, batches,
 		func(s signal.Signal) { // every signal, delivered or suppressed, is persisted
 			select {
@@ -217,7 +248,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 
 	ln, err := net.Listen("tcp", httpAddr)
 	if err != nil {
-		return fmt.Errorf("http listen: %w", err)
+		return fatal(fmt.Errorf("http listen: %w", err))
 	}
 	srv := &http.Server{Handler: mon.Handler(), ReadHeaderTimeout: 5 * time.Second}
 
@@ -229,7 +260,8 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		})
 	})
 	g.Go(func() error {
-		reloadLoop(gctx, raw, store, rest, have, mon, changed, log)
+		refresh := func(ctx context.Context) (map[string]bool, error) { return exchangeSymbols(ctx, rest) }
+		reloadLoop(gctx, raw, store, refresh, have, mon, changed, log)
 		return nil
 	})
 	g.Go(func() error { return ignoreCancel(stream.Run(gctx, symbols, changed, events)) })
@@ -278,7 +310,27 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 
 	log.Info("traderbot started", "symbols", active.Symbols, "intervals", active.Intervals,
 		"rules", len(active.Rules), "channels", len(active.Channels), "http", ln.Addr().String())
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		if ctx.Err() == nil {
+			notifyFatal(disp, "运行失败", err, log)
+		}
+		return err
+	}
+	return nil
+}
+
+// notifyFatal pushes a critical system message to every channel and runs the
+// Dispatcher (whose own Run has not started or has already returned) until it
+// is delivered or fatalNotifyTimeout passes.
+func notifyFatal(disp *notify.Dispatcher, title string, err error, log *slog.Logger) {
+	log.Error(title, "err", err)
+	disp.SendSystem(notify.Message{Title: title, Level: config.LevelCritical,
+		Lines: []string{"traderbot 即将退出", err.Error()}})
+	in := make(chan signal.Batch)
+	close(in) // closed input: Run drains the queues, then returns
+	dctx, cancel := context.WithTimeout(context.Background(), fatalNotifyTimeout)
+	defer cancel()
+	_ = disp.Run(dctx, in)
 }
 
 func ignoreCancel(err error) error {
@@ -343,7 +395,7 @@ func droppedMessage(dropped []string) notify.Message {
 // updates the health monitor when the pool changed. Notification channels,
 // the database DSN and the Binance URLs are fixed at startup: a change to
 // them is logged and takes effect only after a restart.
-func reloadLoop(ctx context.Context, raw, store *config.Store, rest *binance.REST, have map[string]bool,
+func reloadLoop(ctx context.Context, raw, store *config.Store, refresh func(context.Context) (map[string]bool, error), have map[string]bool,
 	mon *health.Monitor, changed chan<- struct{}, log *slog.Logger) {
 	sub := raw.Subscribe()
 	for {
@@ -353,7 +405,7 @@ func reloadLoop(ctx context.Context, raw, store *config.Store, rest *binance.RES
 			return
 		case c = <-sub:
 		}
-		if fresh, err := exchangeSymbols(ctx, rest); err == nil {
+		if fresh, err := refresh(ctx); err == nil {
 			have = fresh
 		} else if ctx.Err() == nil {
 			log.Warn("config reload: exchangeInfo failed, validating symbols against the cached list", "err", err)
@@ -408,10 +460,13 @@ func warmupPlan(ivs []market.Interval) map[market.Interval]int {
 
 // warmup returns the Router's history func: REST bars per warmupPlan, bounded
 // by warmupTimeout. The 1m bars are fetched first and seed the stream's gap
-// detection with the last closed bar.
-func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk clock.Clock, log *slog.Logger) engine.HistoryFunc {
-	return func(ctx context.Context, symbol string) (map[market.Interval][]market.Kline, error) {
-		ctx, cancel := context.WithTimeout(ctx, warmupTimeout)
+// detection with the last closed bar. A failure alerts ("预热失败: SYMBOL");
+// on timeout the bars fetched so far are returned, otherwise the error (the
+// worker then starts cold). A shutdown neither alerts nor logs.
+func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk clock.Clock,
+	alert func(notify.Message), log *slog.Logger) engine.HistoryFunc {
+	return func(parent context.Context, symbol string) (map[market.Interval][]market.Kline, error) {
+		ctx, cancel := context.WithTimeout(parent, warmupTimeout)
 		defer cancel()
 		plan := warmupPlan(store.Current().Intervals)
 		ivs := make([]market.Interval, 0, len(plan))
@@ -428,7 +483,18 @@ func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk
 			start := now.Truncate(d).Add(-time.Duration(n) * d)
 			ks, err := rest.Klines(ctx, symbol, iv, start, n)
 			if err != nil {
-				return nil, fmt.Errorf("warmup %s %s: %w", symbol, iv, err)
+				if parent.Err() != nil {
+					return nil, err
+				}
+				err = fmt.Errorf("warmup %s %s: %w", symbol, iv, err)
+				timedOut := ctx.Err() != nil
+				alert(notify.Message{Title: "预热失败: " + symbol, Level: config.LevelWarn,
+					Lines: []string{warmupFailText(timedOut, out), err.Error()}})
+				if timedOut {
+					log.Warn("warmup timed out, using the bars fetched so far", "symbol", symbol, "bars", total, "err", err)
+					return out, nil
+				}
+				return nil, err
 			}
 			out[iv] = ks
 			total += len(ks)
@@ -444,6 +510,18 @@ func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk
 		log.Info("warmup done", "symbol", symbol, "bars", total)
 		return out, nil
 	}
+}
+
+func warmupFailText(timedOut bool, got map[market.Interval][]market.Kline) string {
+	if !timedOut {
+		return "历史 K 线拉取失败，该币种冷启动：指标要等实时 K 线积累后才可用，期间相关规则不会触发"
+	}
+	var ivs []string
+	for iv := range got {
+		ivs = append(ivs, string(iv))
+	}
+	sort.Strings(ivs)
+	return "历史 K 线拉取超时，仅使用已拉到的周期 " + fmt.Sprint(ivs) + "，其余周期要等实时 K 线积累后才可用"
 }
 
 // fanOut forwards every market event to the Router (never dropped; a full

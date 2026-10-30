@@ -58,6 +58,9 @@ type Stream struct {
 
 	emitMu     sync.Mutex
 	lastClosed map[string]time.Time // last emitted closed 1m OpenTime per symbol
+	// holeTried is, per symbol, the OpenTime of the unclosed bar whose
+	// frame last triggered a hole fill, so it is attempted once per bar.
+	holeTried map[string]time.Time
 
 	stateMu  sync.Mutex
 	shardUp  map[int]bool
@@ -89,6 +92,7 @@ func NewStream(wsURL string, rest *REST, clk clock.Clock, onState func(connected
 		rotateAfter: 23 * time.Hour,
 		fillTimeout: 10 * time.Second,
 		lastClosed:  make(map[string]time.Time),
+		holeTried:   make(map[string]time.Time),
 	}
 }
 
@@ -160,6 +164,11 @@ func (s *Stream) pruneLastClosed(syms []string) {
 	for sym := range s.lastClosed {
 		if !keep[sym] {
 			delete(s.lastClosed, sym)
+		}
+	}
+	for sym := range s.holeTried {
+		if !keep[sym] {
+			delete(s.holeTried, sym)
 		}
 	}
 }
@@ -528,7 +537,11 @@ func (s *Stream) handle(ctx context.Context, b []byte, out chan<- market.Event) 
 
 // forward sends ev unless it is a kline at or before the last emitted closed
 // bar of its symbol. A closed bar that skips ahead of last+1m first gets the
-// hole filled over REST (see fillHoleLocked). Sends are serialized so
+// hole filled over REST (see fillHoleLocked). So does the first unclosed
+// frame of such a bar once the missing bars have safely closed (closeMargin):
+// a closed frame lost around a reconnect is then recovered within seconds,
+// not a minute later. That unclosed-frame attempt is made once per bar; if it
+// fails, the bar's closed frame tries again. Sends are serialized so
 // ordering holds across connections overlapping during rotation; a hole fill
 // therefore holds back events of other connections until it finishes.
 func (s *Stream) forward(ctx context.Context, ev market.Event, out chan<- market.Event) {
@@ -542,8 +555,14 @@ func (s *Stream) forward(ctx context.Context, ev market.Event, out chan<- market
 		if seen && !k.OpenTime.After(last) {
 			return
 		}
-		if seen && k.Closed && k.OpenTime.After(last.Add(time.Minute)) {
-			s.fillHoleLocked(ctx, k.Symbol, k.OpenTime, out)
+		if seen && k.OpenTime.After(last.Add(time.Minute)) {
+			switch {
+			case k.Closed:
+				s.fillHoleLocked(ctx, k.Symbol, k.OpenTime, out)
+			case !s.clk.Now().Before(k.OpenTime.Add(closeMargin)) && !s.holeTried[k.Symbol].Equal(k.OpenTime):
+				s.holeTried[k.Symbol] = k.OpenTime
+				s.fillHoleLocked(ctx, k.Symbol, k.OpenTime, out)
+			}
 		}
 	}
 	s.emitLocked(ctx, ev, out)

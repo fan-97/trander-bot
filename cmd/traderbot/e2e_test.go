@@ -20,6 +20,10 @@ import (
 	"trader-bot/internal/signal"
 )
 
+// pumpSpacing separates the pump bars on the fake WS; it exceeds the
+// configured 200ms merge window.
+const pumpSpacing = 300 * time.Millisecond
+
 // recordedClosedOpen is the OpenTime of testdata/ws_kline_closed.json.
 var recordedClosedOpen = time.UnixMilli(1793383020000).UTC()
 
@@ -168,15 +172,24 @@ func fakeBinance(t *testing.T) *httptest.Server {
 		}
 		defer c.CloseNow()
 		ctx := c.CloseRead(r.Context())
-		msgs := append([][]byte(nil), recorded...)
-		for _, b := range pump {
-			msgs = append(msgs, wsKline(b))
-		}
-		for _, m := range msgs {
+		send := func(m []byte, pause time.Duration) bool {
 			if err := c.Write(ctx, websocket.MessageText, m); err != nil {
+				return false
+			}
+			time.Sleep(pause)
+			return true
+		}
+		for _, m := range recorded {
+			if !send(m, 20*time.Millisecond) {
 				return
 			}
-			time.Sleep(20 * time.Millisecond)
+		}
+		// Pump bars are spaced wider than the 200ms merge window, so a repeat
+		// fire would land in a separate Telegram message.
+		for _, b := range pump {
+			if !send(wsKline(b), pumpSpacing) {
+				return
+			}
 		}
 		<-ctx.Done() // keep the connection open like Binance does
 	})
@@ -279,11 +292,15 @@ binance:
 	waitFor(t, 10*time.Second, "a Telegram message with pump_with_volume", func() bool {
 		return len(tg.matching("pump_with_volume")) >= 1
 	})
-	// The continued pump bars were streamed right behind the first one; give
-	// them (and several merge windows) time to produce a second message.
-	time.Sleep(1500 * time.Millisecond)
-	if got := tg.matching("pump_with_volume"); len(got) != 1 {
-		t.Fatalf("Telegram got %d pump_with_volume messages, want 1: %q", len(got), got)
+	// The continued pump bars arrive pumpSpacing apart, each beyond the merge
+	// window; wait for all of them plus several merge windows.
+	time.Sleep(3*pumpSpacing + time.Second)
+	total := 0
+	for _, txt := range tg.matching("") {
+		total += strings.Count(txt, "pump_with_volume")
+	}
+	if total != 1 {
+		t.Fatalf("pump_with_volume appears %d times across Telegram messages, want 1: %q", total, tg.matching(""))
 	}
 	if !strings.Contains(tg.matching("pump_with_volume")[0], "BTCUSDT") {
 		t.Errorf("message lacks the symbol: %q", tg.matching("pump_with_volume")[0])
@@ -292,10 +309,6 @@ binance:
 	waitFor(t, 5*time.Second, "the signal row in storage", func() bool {
 		return len(sink.signalRows("pump_with_volume")) >= 1
 	})
-	rows := sink.signalRows("pump_with_volume")
-	if rows[0].Symbol != "BTCUSDT" || rows[0].Suppressed != "" {
-		t.Errorf("signal row = %+v, want BTCUSDT delivered", rows[0])
-	}
 
 	cancel()
 	select {
@@ -306,6 +319,12 @@ binance:
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return within 10s of cancel")
 	}
+	// After run returns the Writer has done its final flush: every recorded
+	// signal (delivered or suppressed) is in the sink.
+	rows := sink.signalRows("pump_with_volume")
+	if len(rows) != 1 || rows[0].Symbol != "BTCUSDT" || rows[0].Suppressed != "" {
+		t.Errorf("signal rows = %+v, want exactly one delivered BTCUSDT row", rows)
+	}
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	if !sink.closed {
@@ -313,5 +332,44 @@ binance:
 	}
 	if sink.klines == 0 {
 		t.Error("no klines persisted")
+	}
+}
+
+// A startup failure after the notifiers exist is pushed as a critical system
+// message before run returns.
+func TestRun_StartupFailureNotifies(t *testing.T) {
+	binanceDown := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "maintenance", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(binanceDown.Close)
+	tg := &fakeTelegram{}
+	tgSrv := httptest.NewServer(http.HandlerFunc(tg.handler))
+	t.Cleanup(tgSrv.Close)
+	cfg := fmt.Sprintf(`
+symbols: [BTCUSDT]
+rules:
+  - {id: r, interval: 1m, when: close > 1, channels: [tg]}
+channels:
+  tg: {type: telegram, params: {token: T, chat_id: "1", base_url: %s}}
+binance:
+  rest_url: %s
+`, tgSrv.URL, binanceDown.URL)
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSink{}
+	start := time.Now()
+	err := run(context.Background(), cfgPath, "127.0.0.1:0", Deps{
+		OpenStore: func(context.Context, string) (Store, error) { return sink, nil },
+	})
+	if err == nil {
+		t.Fatal("run succeeded against a failing exchangeInfo")
+	}
+	if el := time.Since(start); el > 7*time.Second {
+		t.Errorf("run took %v", el)
+	}
+	if got := tg.matching("启动失败"); len(got) != 1 || !strings.Contains(got[0], "exchange") {
+		t.Errorf("telegram = %q, want one 启动失败 message naming the error", tg.matching(""))
 	}
 }

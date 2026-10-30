@@ -691,3 +691,71 @@ func TestStream_HolePartlyFilledLogsWarnNotError(t *testing.T) {
 		t.Fatalf("logs: %s", l)
 	}
 }
+
+// A closed frame lost around a reconnect is recovered from the next bar's
+// first unclosed frame once the missing bar is safely closed (closeMargin),
+// instead of waiting a whole minute for the next closed frame.
+func TestStream_UnclosedFrameAfterHoleTriggersFill(t *testing.T) {
+	m := t0.Truncate(time.Minute) // 12:00; clock starts at 12:00:30
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if q := r.URL.Query(); q.Get("startTime") != fmt.Sprint(m.UnixMilli()) {
+			t.Errorf("startTime %s", q.Get("startTime"))
+		}
+		fmt.Fprintf(w, "[%s]", klineRow(m, 1))
+	}, "BTCUSDT")
+	h.s.readTimeout = 48 * time.Hour
+	h.run()
+	sc1 := h.ws.next(t)
+	h.state(true)
+	sc1.send(t, klineMsg("BTCUSDT", m.Add(-time.Minute), true, 0))
+	wantKline(t, h.event(), m.Add(-time.Minute), true)
+
+	sc1.c.CloseNow() // the closed 12:00 frame is lost while reconnecting
+	h.state(false)
+	h.clk.Advance(31 * time.Second) // 12:01:01
+	sc2 := h.ws.next(t)
+	h.state(true) // reconnect gap fill: 12:00 ended only 1s ago, not fetched
+	h.noEvent()
+
+	// Within closeMargin of the hole's end: forwarded, no fill yet.
+	sc2.send(t, klineMsg("BTCUSDT", m.Add(time.Minute), false, 2))
+	wantKline(t, h.event(), m.Add(time.Minute), false)
+	if c := calls.Load(); c != 0 {
+		t.Fatalf("rest calls %d before closeMargin", c)
+	}
+
+	h.clk.Advance(2 * time.Second) // 12:01:03
+	sc2.send(t, klineMsg("BTCUSDT", m.Add(time.Minute), false, 2))
+	wantKline(t, h.event(), m, true)
+	wantKline(t, h.event(), m.Add(time.Minute), false)
+	sc2.send(t, klineMsg("BTCUSDT", m.Add(time.Minute), false, 2))
+	wantKline(t, h.event(), m.Add(time.Minute), false)
+	h.noEvent()
+	if c := calls.Load(); c != 1 {
+		t.Fatalf("rest calls %d, want 1", c)
+	}
+}
+
+// A failed fill from an unclosed frame is not retried on every following
+// unclosed frame of the same bar (each would hold emitMu for seconds).
+func TestStream_UnclosedFrameFillTriedOncePerBar(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, "[]") // REST does not have the bars
+	}, false) // last closed 11:59, now 12:03:30
+	sc.send(t, klineMsg("BTCUSDT", m.Add(3*time.Minute), false, 4))
+	wantKline(t, h.eventAdvancing(500*time.Millisecond), m.Add(3*time.Minute), false)
+	tried := calls.Load()
+	if tried == 0 {
+		t.Fatal("no fill attempted")
+	}
+	sc.send(t, klineMsg("BTCUSDT", m.Add(3*time.Minute), false, 4))
+	wantKline(t, h.event(), m.Add(3*time.Minute), false)
+	if c := calls.Load(); c != tried {
+		t.Fatalf("rest calls %d after a second unclosed frame, want %d", c, tried)
+	}
+}
