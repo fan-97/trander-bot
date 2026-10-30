@@ -1,15 +1,12 @@
 package notify
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -54,69 +51,45 @@ func (t *Telegram) Name() string { return t.name }
 
 // Send posts m to the configured chat.
 func (t *Telegram) Send(ctx context.Context, m Message) error {
-	body, err := json.Marshal(map[string]any{
+	body := map[string]any{
 		"chat_id":                  t.chatID,
 		"text":                     renderTelegram(m),
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
+	}
+	err := postJSON(ctx, t.hc, t.baseURL+"/bot"+t.token+"/sendMessage", body, func(status int, raw []byte) error {
+		var r struct {
+			OK          bool   `json:"ok"`
+			Description string `json:"description"`
+		}
+		jerr := json.Unmarshal(raw, &r)
+		if status < 200 || status > 299 {
+			desc := r.Description
+			if desc == "" {
+				desc = strings.TrimSpace(string(raw))
+			}
+			return fmt.Errorf("telegram %s: HTTP %d: %s", t.name, status, desc)
+		}
+		if jerr != nil {
+			return fmt.Errorf("telegram %s: bad response: %w", t.name, jerr)
+		}
+		if !r.OK {
+			return fmt.Errorf("telegram %s: not ok: %s", t.name, r.Description)
+		}
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("telegram %s: %w", t.name, err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		t.baseURL+"/bot"+t.token+"/sendMessage", bytes.NewReader(body))
-	if err != nil {
 		return t.redact(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := t.hc.Do(req)
-	if err != nil {
-		return t.redact(err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	var r struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
-	}
-	jerr := json.Unmarshal(raw, &r)
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		desc := r.Description
-		if desc == "" {
-			desc = strings.TrimSpace(string(raw))
-		}
-		return t.redact(fmt.Errorf("telegram %s: HTTP %d: %s", t.name, resp.StatusCode, desc))
-	}
-	if jerr != nil {
-		return t.redact(fmt.Errorf("telegram %s: bad response: %w", t.name, jerr))
-	}
-	if !r.OK {
-		return t.redact(fmt.Errorf("telegram %s: not ok: %s", t.name, r.Description))
 	}
 	return nil
 }
 
-// redactedError hides the bot token, which is part of the request URL and
-// therefore appears in *url.Error messages.
-type redactedError struct {
-	msg string
-	err error
-}
-
-func (e *redactedError) Error() string { return e.msg }
-func (e *redactedError) Unwrap() error { return e.err }
-
 func (t *Telegram) redact(err error) error {
-	inner := err
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		inner = ue.Err // keep context.DeadlineExceeded etc. reachable via errors.Is
+	r := redactURLError(err, t.token)
+	if !strings.HasPrefix(r.Error(), "telegram ") {
+		return &redactedError{msg: "telegram " + t.name + ": " + r.Error(), err: errors.Unwrap(r)}
 	}
-	msg := strings.ReplaceAll(err.Error(), t.token, "<redacted>")
-	if !strings.HasPrefix(msg, "telegram ") {
-		msg = "telegram " + t.name + ": " + msg
-	}
-	return &redactedError{msg: msg, err: inner}
+	return r
 }
 
 // renderTelegram builds the HTML text: bold title, one line per entry, then

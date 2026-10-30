@@ -40,6 +40,18 @@ func NewFromConfig(name string, c config.ChannelConfig, hc *http.Client) (Notifi
 	switch c.Type {
 	case "telegram":
 		return newTelegram(name, c.Params, hc)
+	case "discord":
+		return newDiscord(name, c.Params, hc)
+	case "webhook":
+		return newWebhook(name, c.Params, hc)
+	case "email":
+		return newEmail(name, c.Params)
+	case "wecom":
+		return newWecom(name, c.Params, hc)
+	case "dingtalk":
+		return newDingtalk(name, c.Params, hc)
+	case "feishu":
+		return newFeishu(name, c.Params, hc)
 	}
 	return nil, fmt.Errorf("channel %q: %w %q", name, ErrUnknownChannelType, c.Type)
 }
