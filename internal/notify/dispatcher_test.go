@@ -1,8 +1,11 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,7 +92,7 @@ type harness struct {
 	done   chan error
 }
 
-func start(t *testing.T, ns map[string]Notifier, fb map[string]string, qsize int) *harness {
+func start(t *testing.T, ns map[string]Notifier, fb map[string]string, qsize int, opts ...func(*Dispatcher)) *harness {
 	t.Helper()
 	h := &harness{
 		clk:   clock.NewFake(time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)),
@@ -99,6 +102,9 @@ func start(t *testing.T, ns map[string]Notifier, fb map[string]string, qsize int
 	}
 	h.d = NewDispatcher(ns, fb, qsize, h.clk)
 	h.d.onWait = func(d time.Duration) { h.waits <- d }
+	for _, o := range opts {
+		o(h.d)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	go func() { h.done <- h.d.Run(ctx, h.in) }()
@@ -342,5 +348,90 @@ func TestFormat(t *testing.T) {
 	single := Format(batch("tg", "SOLUSDT"))
 	if single.Title != "[WARN] 1 signal(s)" {
 		t.Errorf("single Title = %q", single.Title)
+	}
+}
+
+func TestDispatcher_CancelDuringBackoffReturnsPromptly(t *testing.T) {
+	a := newFake("a")
+	a.fail = func(int) error { return errors.New("down") }
+	h := start(t, map[string]Notifier{"a": a}, nil, 0)
+	h.in <- batch("a", "BTCUSDT")
+	recv(t, a.sent, "attempt 1")
+	recv(t, h.waits, "backoff wait") // worker is now parked in clk.After(1s)
+
+	h.cancel()
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+		h.done <- err // let the cleanup see it too
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Run did not return promptly after cancel during backoff")
+	}
+	if a.count() != 1 {
+		t.Fatalf("calls = %d, want 1", a.count())
+	}
+}
+
+// syncBuf is a goroutine-safe log sink.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestDispatcher_UnknownFallbackLoggedAndDropped(t *testing.T) {
+	var logs syncBuf
+	a := newFake("a")
+	a.fail = func(int) error { return errors.New("down") }
+	h := start(t, map[string]Notifier{"a": a}, map[string]string{"a": "nope"}, 0,
+		func(d *Dispatcher) { d.Logger = slog.New(slog.NewTextHandler(&logs, nil)) })
+	h.in <- batch("a", "BTCUSDT")
+	recv(t, a.sent, "attempt 1")
+	h.advanceWait(t, time.Second)
+	recv(t, a.sent, "attempt 2")
+	h.advanceWait(t, 2*time.Second)
+	recv(t, a.sent, "attempt 3")
+
+	deadline := time.After(2 * time.Second)
+	for !strings.Contains(logs.String(), "unknown fallback") {
+		select {
+		case <-deadline:
+			t.Fatalf("no unknown-fallback log; logs:\n%s", logs.String())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if !strings.Contains(logs.String(), "fallback=nope") {
+		t.Fatalf("log lacks fallback name:\n%s", logs.String())
+	}
+	noRecv(t, a.sent, "re-delivery to a")
+	if h.d.Dropped("a") != 0 || h.d.Dropped("nope") != 0 {
+		t.Fatal("unknown fallback must not count as queue drop")
+	}
+}
+
+func TestDispatcher_EmptyBatchIgnored(t *testing.T) {
+	a := newFake("a")
+	h := start(t, map[string]Notifier{"a": a}, nil, 0)
+	h.in <- signal.Batch{Channel: "a"}
+	noRecv(t, a.sent, "delivery of empty batch")
+}
+
+func TestFormat_EmptyBatch(t *testing.T) {
+	m := Format(signal.Batch{Channel: "a"})
+	if m.Title != "[INFO] 0 signal(s)" || m.Level != config.LevelInfo || len(m.Lines) != 0 || len(m.Links) != 0 {
+		t.Fatalf("Format(empty) = %+v", m)
 	}
 }

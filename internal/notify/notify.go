@@ -52,9 +52,10 @@ func tradingViewURL(sym string) string {
 
 // Format renders a batch: one line per signal, a title with the highest level
 // and the signal count, and Binance/TradingView links for each distinct symbol
-// in first-seen order.
+// in first-seen order. An empty batch (which the Batcher never emits) yields
+// "[INFO] 0 signal(s)" with level info.
 func Format(b signal.Batch) Message {
-	m := Message{Lines: make([]string, 0, len(b.Signals))}
+	m := Message{Level: config.LevelInfo, Lines: make([]string, 0, len(b.Signals))}
 	seen := make(map[string]bool)
 	for i, s := range b.Signals {
 		if i == 0 || s.Level.Rank() > m.Level.Rank() {

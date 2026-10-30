@@ -3,14 +3,18 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"trader-bot/internal/config"
+	"trader-bot/internal/market"
+	"trader-bot/internal/signal"
 )
 
 const testToken = "123456:SECRET-token"
@@ -158,4 +162,65 @@ func TestNewFromConfig(t *testing.T) {
 	if tg.(*Telegram).baseURL != "https://api.telegram.org" {
 		t.Errorf("default base_url = %q", tg.(*Telegram).baseURL)
 	}
+}
+
+var entityRE = regexp.MustCompile(`&(amp|lt|gt|quot|#39);`)
+
+// checkHTML asserts text fits Telegram's limit, has balanced tags and no
+// partial entities.
+func checkHTML(t *testing.T, text string) {
+	t.Helper()
+	if c := utf8.RuneCountInString(text); c > telegramMaxChars {
+		t.Fatalf("text has %d runes, want <= %d", c, telegramMaxChars)
+	}
+	if o, c := strings.Count(text, "<a "), strings.Count(text, "</a>"); o != c {
+		t.Fatalf("<a> open=%d close=%d", o, c)
+	}
+	if o, c := strings.Count(text, "<b>"), strings.Count(text, "</b>"); o != 1 || c != 1 {
+		t.Fatalf("<b> open=%d close=%d", o, c)
+	}
+	if stripped := entityRE.ReplaceAllString(text, ""); strings.Contains(stripped, "&") {
+		t.Fatalf("partial entity in text")
+	}
+	// Outside tags there must be no raw '<' or '>'.
+	tagRE := regexp.MustCompile(`</?(b|a)( href="[^"<>]*")?>`)
+	if rest := tagRE.ReplaceAllString(text, ""); strings.ContainsAny(rest, "<>") {
+		t.Fatalf("broken tag in text")
+	}
+}
+
+func TestRenderTelegram_ManySymbols(t *testing.T) {
+	var b signal.Batch
+	for i := 0; i < 40; i++ {
+		b.Signals = append(b.Signals, signal.Signal{
+			RuleID: "pump_with_volume", Symbol: fmt.Sprintf("SYM%02dUSDT", i), Interval: market.I5m,
+			Level: config.LevelWarn, Price: 1.5, Detail: "change_pct(1)=3.4 > 3 & x",
+		})
+	}
+	text := renderTelegram(Format(b))
+	checkHTML(t, text)
+	if !strings.Contains(text, "more symbols") {
+		t.Fatalf("missing '+N more symbols' marker")
+	}
+	// Links are capped, so every one of the 40 lines (~72 runes each) still fits.
+	if !strings.Contains(text, "SYM39USDT pump_with_volume") {
+		t.Fatalf("lines were dropped although they fit once links are capped")
+	}
+	if strings.Contains(text, "more)") {
+		t.Fatalf("unexpected line truncation")
+	}
+}
+
+func TestRenderTelegram_HugeTitleAndLines(t *testing.T) {
+	lines := make([]string, 300)
+	for i := range lines {
+		lines[i] = strings.Repeat("<&>", 20)
+	}
+	links := make([]Link, 0, 200)
+	for i := 0; i < 100; i++ {
+		s := fmt.Sprintf("S%dUSDT", i)
+		links = append(links, Link{"Binance " + s, binanceURL(s)}, Link{"TradingView " + s, tradingViewURL(s)})
+	}
+	text := renderTelegram(Message{Title: strings.Repeat("<&\"'>", 2000), Lines: lines, Links: links})
+	checkHTML(t, text)
 }

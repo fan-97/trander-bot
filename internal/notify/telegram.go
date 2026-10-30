@@ -120,25 +120,21 @@ func (t *Telegram) redact(err error) error {
 }
 
 // renderTelegram builds the HTML text: bold title, one line per entry, then
-// the links. If the result exceeds Telegram's limit, trailing lines are
-// replaced by "…(+N more)".
+// the links. It never slices HTML, so the result always parses:
+//   - links are capped at telegramLinkBudget (1000) runes; omitted ones become
+//     "+N more symbols" (N = distinct symbols, the last word of a link text);
+//   - if still over the limit, trailing lines are replaced by "…(+N more)";
+//   - if the title alone is still too long, the plain title is cut before
+//     escaping.
 func renderTelegram(m Message) string {
-	head := "<b>" + html.EscapeString(m.Title) + "</b>"
-	var links string
-	if len(m.Links) > 0 {
-		parts := make([]string, len(m.Links))
-		for i, l := range m.Links {
-			parts[i] = `<a href="` + html.EscapeString(l.URL) + `">` + html.EscapeString(l.Text) + "</a>"
-		}
-		links = strings.Join(parts, " | ")
-	}
+	links := renderLinks(m.Links)
 	lines := make([]string, len(m.Lines))
 	for i, l := range m.Lines {
 		lines[i] = html.EscapeString(l)
 	}
 
-	build := func(n int) string {
-		parts := []string{head}
+	build := func(title string, n int) string {
+		parts := []string{"<b>" + html.EscapeString(title) + "</b>"}
 		parts = append(parts, lines[:n]...)
 		if n < len(lines) {
 			parts = append(parts, fmt.Sprintf("…(+%d more)", len(lines)-n))
@@ -149,16 +145,70 @@ func renderTelegram(m Message) string {
 		return strings.Join(parts, "\n")
 	}
 
+	// Drop trailing lines until the text fits (quadratic in the worst case,
+	// which is negligible for batch-sized inputs).
 	n := len(lines)
-	text := build(n)
-	for utf8.RuneCountInString(text) > telegramMaxChars && n > 0 {
+	size := utf8.RuneCountInString(build(m.Title, n))
+	for size > telegramMaxChars && n > 0 {
 		n--
-		text = build(n)
+		size = utf8.RuneCountInString(build(m.Title, n))
 	}
-	if utf8.RuneCountInString(text) > telegramMaxChars {
-		// Title/links alone are too long: hard cut (may break HTML, but
-		// this is far beyond any realistic message).
-		text = string([]rune(text)[:telegramMaxChars])
+	if size <= telegramMaxChars {
+		return build(m.Title, n)
 	}
-	return text
+
+	// Only the title can still be too long. Escaping never shortens text,
+	// so cutting `excess` raw runes removes at least `excess` output runes.
+	title := []rune(m.Title)
+	for size > telegramMaxChars && len(title) > 0 {
+		cut := min(size-telegramMaxChars+1, len(title)) // +1 makes room for "…"
+		title = title[:len(title)-cut]
+		size = utf8.RuneCountInString(build(string(title)+"…", n))
+	}
+	return build(string(title)+"…", n)
+}
+
+// telegramLinkBudget caps the rendered link block so a market-wide batch
+// still leaves room for the signal lines.
+const telegramLinkBudget = 1000
+
+// renderLinks renders links joined by " | ", stopping before the block would
+// exceed telegramLinkBudget runes and appending "+N more symbols" for the
+// rest. Each link is rendered whole, so the HTML is always balanced.
+func renderLinks(ls []Link) string {
+	if len(ls) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(ls))
+	size := 0
+	k := 0
+	for ; k < len(ls); k++ {
+		p := `<a href="` + html.EscapeString(ls[k].URL) + `">` + html.EscapeString(ls[k].Text) + "</a>"
+		add := utf8.RuneCountInString(p)
+		if k > 0 {
+			add += len(" | ")
+		}
+		// Reserve room for the "+N more symbols" marker (< 40 runes).
+		if size+add > telegramLinkBudget-40 {
+			break
+		}
+		parts = append(parts, p)
+		size += add
+	}
+	out := strings.Join(parts, " | ")
+	if k < len(ls) {
+		syms := make(map[string]bool)
+		for _, l := range ls[k:] {
+			f := strings.Fields(l.Text)
+			if len(f) > 0 {
+				syms[f[len(f)-1]] = true
+			}
+		}
+		marker := fmt.Sprintf("+%d more symbols", len(syms))
+		if out == "" {
+			return marker
+		}
+		out += " | " + marker
+	}
+	return out
 }

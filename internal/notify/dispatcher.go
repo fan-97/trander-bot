@@ -24,9 +24,9 @@ const (
 	drainTimeout = 10 * time.Second
 )
 
-// backoff is the wait before attempt i+1 (exponential, 1s/2s/4s). With
-// maxAttempts = 3 only the first two entries are used.
-var backoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+// backoff[i] is the wait before attempt i+2 (exponential); it has
+// maxAttempts-1 entries.
+var backoff = []time.Duration{time.Second, 2 * time.Second}
 
 type item struct {
 	msg      Message
@@ -203,6 +203,10 @@ func (d *Dispatcher) Run(ctx context.Context, in <-chan signal.Batch) error {
 				shutdown()
 				return nil
 			}
+			if len(b.Signals) == 0 {
+				// The Batcher never emits an empty batch; ignore one defensively.
+				continue
+			}
 			d.enqueue(b.Channel, item{msg: Format(b)})
 		}
 	}
@@ -250,7 +254,7 @@ func (d *Dispatcher) deliver(ctx context.Context, name string, n Notifier, it it
 	var err error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			wait := backoff[min(attempt-1, len(backoff)-1)]
+			wait := backoff[attempt-1]
 			ch := d.clk.After(wait)
 			if d.onWait != nil {
 				d.onWait(wait)
