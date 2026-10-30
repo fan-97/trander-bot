@@ -21,6 +21,9 @@ func newWecom(name string, p map[string]string, hc *http.Client) (*Wecom, error)
 	if err := requireParams(name, "wecom", p, "url"); err != nil {
 		return nil, err
 	}
+	if err := validateURL(name, "wecom", p["url"]); err != nil {
+		return nil, err
+	}
 	return &Wecom{name: name, url: p["url"], hc: newHTTPClient(hc)}, nil
 }
 

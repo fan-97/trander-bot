@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -53,49 +55,102 @@ func redactURLError(err error, secrets ...string) error {
 }
 
 // urlSecrets lists the substrings of a request URL that may hold secrets
-// (the whole URL, path, query and query values).
+// (the whole URL, path, query and longer query values). Fragments shorter
+// than 6 bytes are skipped so error text is not garbled.
 func urlSecrets(raw string) []string {
-	out := []string{raw}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return out
+	cand := []string{raw}
+	if u, err := url.Parse(raw); err == nil {
+		cand = append(cand, u.String(), u.RawQuery, u.EscapedPath(), u.Path)
+		for _, vs := range u.Query() {
+			cand = append(cand, vs...)
+		}
+		if u.User != nil {
+			cand = append(cand, u.User.String())
+			if p, ok := u.User.Password(); ok {
+				cand = append(cand, p)
+			}
+		}
 	}
-	out = append(out, u.String(), u.RawQuery, u.EscapedPath())
-	if len(u.Path) > 1 {
-		out = append(out, u.Path)
-	}
-	for _, vs := range u.Query() {
-		out = append(out, vs...)
-	}
-	if u.User != nil {
-		out = append(out, u.User.String())
-		if p, ok := u.User.Password(); ok {
-			out = append(out, p)
+	out := cand[:0]
+	for _, c := range cand {
+		if len(c) >= 6 {
+			out = append(out, c)
 		}
 	}
 	return out
 }
 
+// errInvalidURL is returned instead of the library's parse error, which would
+// print the (secret-bearing) URL in a form redaction cannot match.
+var errInvalidURL = errors.New("invalid webhook URL")
+
+// validateURL checks that raw is an absolute http(s) URL. The error names the
+// param but never echoes the value.
+func validateURL(name, typ, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || strings.ContainsFunc(raw, unicode.IsControl) {
+		return fmt.Errorf("channel %q: %s url is invalid", name, typ)
+	}
+	return nil
+}
+
+func newHTTPClient(hc *http.Client) *http.Client {
+	if hc == nil {
+		return &http.Client{Timeout: 15 * time.Second}
+	}
+	return hc
+}
+
+// marshalJSON encodes v without HTML escaping or a trailing newline.
+func marshalJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// fitJSON shrinks text (on rune boundaries) until the marshalled body built
+// from it is at most limit bytes, and returns that body.
+func fitJSON(text string, limit int, build func(text string) any) any {
+	for {
+		v := build(text)
+		raw, err := marshalJSON(v)
+		if err != nil || len(raw) <= limit || text == "" {
+			return v
+		}
+		// Each raw byte marshals to at least one byte, so cutting the excess
+		// always makes progress.
+		text = truncateBytes(text, max(0, len(text)-(len(raw)-limit)))
+	}
+}
+
 // postJSON POSTs body as JSON to rawURL and hands the status and (at most
-// 64 KiB of) response body to check, whose error is returned as is. Transport
-// errors have the URL (and its secret-bearing parts) redacted.
+// 64 KiB of) response body to check. Every returned error has the URL and its
+// secret-bearing parts redacted.
 func postJSON(ctx context.Context, hc *http.Client, rawURL string, body any, check func(status int, respBody []byte) error) error {
-	buf, err := json.Marshal(body)
+	secrets := urlSecrets(rawURL)
+	buf, err := marshalJSON(body)
 	if err != nil {
 		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(buf))
 	if err != nil {
-		return redactURLError(err, urlSecrets(rawURL)...)
+		return errInvalidURL
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := hc.Do(req)
 	if err != nil {
-		return redactURLError(err, urlSecrets(rawURL)...)
+		return redactURLError(err, secrets...)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	return check(resp.StatusCode, raw)
+	if err := check(resp.StatusCode, raw); err != nil {
+		return redactURLError(err, secrets...)
+	}
+	return nil
 }
 
 // check2xx accepts any 2xx status.

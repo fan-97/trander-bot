@@ -8,7 +8,6 @@ import (
 	"html"
 	"net/http"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -40,9 +39,7 @@ func newTelegram(name string, p map[string]string, hc *http.Client) (*Telegram, 
 		t.baseURL = telegramDefaultBase
 	}
 	t.baseURL = strings.TrimRight(t.baseURL, "/")
-	if t.hc == nil {
-		t.hc = &http.Client{Timeout: 15 * time.Second}
-	}
+	t.hc = newHTTPClient(t.hc)
 	return t, nil
 }
 

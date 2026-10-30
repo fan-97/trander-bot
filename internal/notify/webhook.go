@@ -16,6 +16,9 @@ func newWebhook(name string, p map[string]string, hc *http.Client) (*Webhook, er
 	if err := requireParams(name, "webhook", p, "url"); err != nil {
 		return nil, err
 	}
+	if err := validateURL(name, "webhook", p["url"]); err != nil {
+		return nil, err
+	}
 	return &Webhook{name: name, url: p["url"], hc: newHTTPClient(hc)}, nil
 }
 

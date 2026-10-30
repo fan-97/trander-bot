@@ -26,6 +26,9 @@ func newFeishu(name string, p map[string]string, hc *http.Client) (*Feishu, erro
 	if err := requireParams(name, "feishu", p, "url"); err != nil {
 		return nil, err
 	}
+	if err := validateURL(name, "feishu", p["url"]); err != nil {
+		return nil, err
+	}
 	return &Feishu{name: name, url: p["url"], secret: p["secret"], hc: newHTTPClient(hc), now: time.Now}, nil
 }
 
@@ -41,15 +44,15 @@ func feishuSign(secret, timestamp string) string {
 
 // Send posts m, signing the body when a secret is configured.
 func (f *Feishu) Send(ctx context.Context, m Message) error {
-	body := map[string]any{
-		"msg_type": "text",
-		"content":  map[string]string{"text": truncateBytes(renderText(m), feishuMaxBytes)},
-	}
-	if f.secret != "" {
-		ts := strconv.FormatInt(f.now().Unix(), 10)
-		body["timestamp"] = ts
-		body["sign"] = feishuSign(f.secret, ts)
-	}
+	ts := strconv.FormatInt(f.now().Unix(), 10)
+	body := fitJSON(renderText(m), feishuMaxBytes, func(t string) any {
+		b := map[string]any{"msg_type": "text", "content": map[string]string{"text": t}}
+		if f.secret != "" {
+			b["timestamp"] = ts
+			b["sign"] = feishuSign(f.secret, ts)
+		}
+		return b
+	})
 	if err := postJSON(ctx, f.hc, f.url, body, checkFeishu); err != nil {
 		return fmt.Errorf("feishu %s: %w", f.name, redactURLError(err, f.secret))
 	}

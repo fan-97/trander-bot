@@ -27,6 +27,9 @@ func newDingtalk(name string, p map[string]string, hc *http.Client) (*Dingtalk, 
 	if err := requireParams(name, "dingtalk", p, "url", "secret"); err != nil {
 		return nil, err
 	}
+	if err := validateURL(name, "dingtalk", p["url"]); err != nil {
+		return nil, err
+	}
 	return &Dingtalk{name: name, url: p["url"], secret: p["secret"], hc: newHTTPClient(hc), now: time.Now}, nil
 }
 
@@ -49,7 +52,9 @@ func (d *Dingtalk) Send(ctx context.Context, m Message) error {
 		sep = "?"
 	}
 	full := d.url + sep + "timestamp=" + ts + "&sign=" + dingtalkSign(d.secret, ts)
-	body := map[string]any{"msgtype": "text", "text": map[string]string{"content": truncateBytes(renderText(m), dingtalkMaxBytes)}}
+	body := fitJSON(renderText(m), dingtalkMaxBytes, func(t string) any {
+		return map[string]any{"msgtype": "text", "text": map[string]string{"content": t}}
+	})
 	if err := postJSON(ctx, d.hc, full, body, checkErrcode); err != nil {
 		return fmt.Errorf("dingtalk %s: %w", d.name, redactURLError(err, d.secret))
 	}

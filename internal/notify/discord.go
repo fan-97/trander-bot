@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 )
 
 // discordMaxChars is Discord's message content limit.
@@ -16,15 +15,11 @@ type Discord struct {
 	hc        *http.Client
 }
 
-func newHTTPClient(hc *http.Client) *http.Client {
-	if hc == nil {
-		return &http.Client{Timeout: 15 * time.Second}
-	}
-	return hc
-}
-
 func newDiscord(name string, p map[string]string, hc *http.Client) (*Discord, error) {
 	if err := requireParams(name, "discord", p, "url"); err != nil {
+		return nil, err
+	}
+	if err := validateURL(name, "discord", p["url"]); err != nil {
 		return nil, err
 	}
 	return &Discord{name: name, url: p["url"], hc: newHTTPClient(hc)}, nil
