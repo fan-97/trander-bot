@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"trader-bot/internal/market"
+	"trader-bot/internal/rule"
 
 	_ "time/tzdata" // QuietHours TZ validation must work in distroless images
 )
@@ -15,6 +16,10 @@ var channelTypes = map[string]bool{
 	"telegram": true, "discord": true, "webhook": true, "email": true,
 	"wecom": true, "dingtalk": true, "feishu": true,
 }
+
+// realtimeFuncs are the kline operands a realtime rule may use: they have a
+// meaningful provisional value on an unclosed bar.
+var realtimeFuncs = map[string]bool{"close": true, "change_pct": true, "volume": true}
 
 // Validate checks the whole config and returns every problem found, joined.
 func (c *Config) Validate() error {
@@ -69,6 +74,13 @@ func (c *Config) Validate() error {
 		}
 		if r.Trigger != TriggerOnClose && r.Trigger != TriggerRealtime {
 			add("rule %q: unknown trigger %q", r.ID, r.Trigger)
+		}
+		if r.Trigger == TriggerRealtime && r.When != nil {
+			for _, o := range rule.Funcs(r.When) {
+				if !o.IsContract() && !realtimeFuncs[o.Func] {
+					add("rule %q: %s is not supported with trigger realtime (only close, change_pct, volume and contract data)", r.ID, o)
+				}
+			}
 		}
 		if r.Level.Rank() < 0 {
 			add("rule %q: unknown level %q", r.ID, r.Level)

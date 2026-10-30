@@ -146,3 +146,19 @@ func TestValidate_BadExpression(t *testing.T) {
 		}
 	}
 }
+
+func TestValidate_RealtimeOperands(t *testing.T) {
+	head := "symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n"
+	_, err := Parse([]byte(head + `  - {id: a, interval: 5m, trigger: realtime, when: {all: ["rsi(14) < 30"]}, channels: [tg]}`))
+	if err == nil || !strings.Contains(err.Error(), `rule "a"`) || !strings.Contains(err.Error(), "rsi(14)") || !strings.Contains(err.Error(), "realtime") {
+		t.Fatalf("err=%v", err)
+	}
+	// rsi is fine for on_close rules
+	if _, err := Parse([]byte(head + `  - {id: a, interval: 5m, when: {all: ["rsi(14) < 30"]}, channels: [tg]}`)); err != nil {
+		t.Fatalf("on_close: %v", err)
+	}
+	ok := `  - {id: a, interval: 5m, trigger: realtime, when: {any: ["close > 100", "change_pct(3) > 2", "volume > 1000", "funding_rate < -0.0005", "oi_change_pct(4) > 10", "liq_volume(5) > 1000000"]}, channels: [tg]}`
+	if _, err := Parse([]byte(head + ok)); err != nil {
+		t.Fatalf("allowed operands rejected: %v", err)
+	}
+}

@@ -167,3 +167,16 @@ func TestGate_Concurrent(t *testing.T) {
 		t.Fatalf("fires=%d", fires)
 	}
 }
+
+func TestGate_ForgetRuleSymbol(t *testing.T) {
+	g, _ := newGate()
+	g.Observe("r1", "BTCUSDT", rule.True, time.Hour)
+	g.Observe("r1", "ETHUSDT", rule.True, time.Hour)
+	g.ForgetRuleSymbol("r1", "BTCUSDT")
+	if f, _ := g.Observe("r1", "BTCUSDT", rule.True, time.Hour); !f {
+		t.Fatal("r1 BTC not forgotten")
+	}
+	if f, _ := g.Observe("r1", "ETHUSDT", rule.True, time.Hour); f {
+		t.Fatal("r1 ETH wrongly forgotten")
+	}
+}

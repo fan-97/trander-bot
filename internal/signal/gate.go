@@ -96,3 +96,12 @@ func (g *Gate) ForgetSymbol(symbol string) {
 		}
 	}
 }
+
+// ForgetRuleSymbol drops the state of one (rule, symbol) pair. A worker
+// reloading its own rules uses it so it never clears another symbol's state
+// that the other worker has already re-established under the new config.
+func (g *Gate) ForgetRuleSymbol(ruleID, symbol string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.st, key{ruleID, symbol})
+}
