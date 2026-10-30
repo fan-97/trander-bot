@@ -22,8 +22,9 @@ const (
 	finalFlushTimeout = 5 * time.Second
 )
 
-// sink is the persistence surface the Writer needs; *Store implements it.
-type sink interface {
+// Sink is the persistence surface the Writer needs; *Store implements it.
+// Tests and callers without a database can supply their own.
+type Sink interface {
 	WriteKlines(ctx context.Context, ks []market.Kline) error
 	WriteMarkPrices(ctx context.Context, ms []market.MarkPriceEvent) error
 	WriteOI(ctx context.Context, os []market.OpenInterestEvent) error
@@ -32,12 +33,12 @@ type sink interface {
 	WriteSignals(ctx context.Context, ss []signal.Signal) error
 }
 
-var _ sink = (*Store)(nil)
+var _ Sink = (*Store)(nil)
 
 // Writer batches market events and signals into the Store without ever
 // blocking its producer. Set the exported fields before calling Run.
 type Writer struct {
-	s          sink
+	s          Sink
 	batchSize  int
 	flushEvery time.Duration
 
@@ -55,10 +56,11 @@ type Writer struct {
 // NewWriter returns a Writer flushing every batchSize items (default 500) or
 // every flushEvery (default 2s), whichever comes first.
 func NewWriter(s *Store, batchSize int, flushEvery time.Duration) *Writer {
-	return newWriter(s, batchSize, flushEvery)
+	return NewWriterWithSink(s, batchSize, flushEvery)
 }
 
-func newWriter(s sink, batchSize int, flushEvery time.Duration) *Writer {
+// NewWriterWithSink is NewWriter for any Sink.
+func NewWriterWithSink(s Sink, batchSize int, flushEvery time.Duration) *Writer {
 	if batchSize <= 0 {
 		batchSize = 500
 	}

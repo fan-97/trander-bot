@@ -146,9 +146,9 @@ type runner struct {
 	done   chan error
 }
 
-func start(t *testing.T, s sink, batchSize int, flushEvery time.Duration, clk clock.Clock) *runner {
+func start(t *testing.T, s Sink, batchSize int, flushEvery time.Duration, clk clock.Clock) *runner {
 	t.Helper()
-	w := newWriter(s, batchSize, flushEvery)
+	w := NewWriterWithSink(s, batchSize, flushEvery)
 	w.Clock = clk
 	r := &runner{w: w, in: make(chan any), done: make(chan error, 1)}
 	ctx, cancel := context.WithCancel(context.Background())

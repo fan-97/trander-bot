@@ -1,0 +1,561 @@
+// Command traderbot watches Binance USDT-M perpetual futures, evaluates the
+// rules in a YAML config and pushes signals to notification channels.
+//
+//	traderbot -config configs/config.yaml -http :8080
+//	traderbot -healthcheck -http :8080   # container healthcheck: exit 0 if /healthz is 200
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	ossignal "os/signal"
+	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
+
+	"trader-bot/internal/clock"
+	"trader-bot/internal/config"
+	"trader-bot/internal/engine"
+	"trader-bot/internal/exchange/binance"
+	"trader-bot/internal/health"
+	"trader-bot/internal/market"
+	"trader-bot/internal/notify"
+	"trader-bot/internal/signal"
+	"trader-bot/internal/storage"
+)
+
+const (
+	// shutdownTimeout bounds the whole graceful shutdown after SIGINT/SIGTERM.
+	shutdownTimeout = 10 * time.Second
+	// warmupTimeout bounds one symbol's history fetch (R16); on timeout the
+	// worker starts cold.
+	warmupTimeout = 90 * time.Second
+	// warmupBars is how many bars per configured interval are fetched.
+	warmupBars = 500
+	// maxWarmup1m caps the extra 1m bars fetched to fill the current bucket
+	// of the largest interval (R15).
+	maxWarmup1m = 1500
+	// staleAfter is the WS-down / per-symbol silence threshold for alerts.
+	staleAfter = time.Minute
+	// connectDeadline: a critical alert fires if the WS has never connected
+	// this long after start.
+	connectDeadline = 2 * time.Minute
+	// pollEvery is the open interest / long-short sampling period.
+	pollEvery = 5 * time.Minute
+
+	eventBuffer  = 4096
+	routerBuffer = 4096
+	writerBuffer = 4096
+	signalBuffer = 256
+	batchBuffer  = 64
+
+	writerBatch = 500
+	writerFlush = 2 * time.Second
+
+	statsEvery = time.Minute
+)
+
+// Store is the storage surface run needs: the Writer's sink plus Close.
+type Store interface {
+	storage.Sink
+	Close()
+}
+
+// Deps are optional overrides for run; zero values mean production defaults.
+type Deps struct {
+	// HTTPClient is used for Binance REST and HTTP notifiers.
+	HTTPClient *http.Client
+	// Clock drives every component; defaults to clock.Real.
+	Clock clock.Clock
+	// OpenStore opens storage for the configured DSN; defaults to storage.Open.
+	OpenStore func(ctx context.Context, dsn string) (Store, error)
+}
+
+func main() {
+	fs := flag.CommandLine
+	cfgPath := fs.String("config", "configs/config.yaml", "path to the YAML config (hot reloaded)")
+	httpAddr := fs.String("http", ":8080", "listen address for /healthz and /metrics")
+	healthcheck := fs.Bool("healthcheck", false, "GET /healthz on the -http address and exit 0 if it returns 200, else 1")
+	noDB := fs.Bool("no-db", false, "") // hidden: discard all writes (local smoke tests only)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage of %s:\n", os.Args[0])
+		fs.VisitAll(func(f *flag.Flag) {
+			if f.Name == "no-db" {
+				return
+			}
+			fmt.Fprintf(fs.Output(), "  -%s\n    \t%s (default %q)\n", f.Name, f.Usage, f.DefValue)
+		})
+	}
+	flag.Parse()
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+
+	if *healthcheck {
+		os.Exit(probe(*httpAddr))
+	}
+
+	ctx, stop := ossignal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	context.AfterFunc(ctx, func() {
+		slog.Info("shutting down")
+		time.AfterFunc(shutdownTimeout, func() {
+			slog.Error("shutdown did not finish in time, exiting", "timeout", shutdownTimeout)
+			os.Exit(1)
+		})
+	})
+
+	var deps Deps
+	if *noDB {
+		slog.Warn("-no-db: storage disabled, market data and signals are NOT persisted")
+		deps.OpenStore = func(context.Context, string) (Store, error) { return discardStore{}, nil }
+	}
+	if err := run(ctx, *cfgPath, *httpAddr, deps); err != nil {
+		slog.Error("traderbot exited", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("traderbot stopped")
+}
+
+// run wires every component and blocks until ctx is cancelled (returns nil)
+// or a component fails (returns its error). Storage is closed last.
+func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
+	log := slog.Default()
+	clk := deps.Clock
+	if clk == nil {
+		clk = clock.Real{}
+	}
+	openStore := deps.OpenStore
+	if openStore == nil {
+		openStore = func(ctx context.Context, dsn string) (Store, error) {
+			s, err := storage.Open(ctx, dsn)
+			if err != nil {
+				return nil, err
+			}
+			return s, nil
+		}
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	st, err := openStore(ctx, cfg.Database.DSN)
+	if err != nil {
+		return fmt.Errorf("open storage: %w", err)
+	}
+	defer st.Close() // deferred first, so it runs after everything else has stopped
+
+	disp, err := newDispatcher(cfg, deps.HTTPClient, clk)
+	if err != nil {
+		return err
+	}
+	mon := health.NewMonitor(clk, disp.SendSystem, staleAfter)
+
+	rest := binance.NewREST(cfg.Binance.RESTURL, binance.DefaultWeightPerMin)
+	rest.Clock = clk
+	if deps.HTTPClient != nil {
+		rest.HTTP = deps.HTTPClient
+	}
+	have, err := exchangeSymbols(ctx, rest)
+	if err != nil {
+		return fmt.Errorf("load exchange symbols: %w", err)
+	}
+	active, dropped := filterSymbols(cfg, have)
+	if len(active.Symbols) == 0 {
+		return fmt.Errorf("none of the configured symbols %v is a tradable USDT perpetual", cfg.Symbols)
+	}
+	if len(dropped) > 0 {
+		log.Warn("ignoring symbols that are not tradable USDT perpetuals", "dropped", dropped)
+		disp.SendSystem(droppedMessage(dropped))
+	}
+
+	raw := config.NewStore(cfg)      // what is on disk; config.Watch publishes here
+	store := config.NewStore(active) // what the bot runs on: symbols validated
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	events := make(chan market.Event, eventBuffer)
+	routerIn := make(chan market.Event, routerBuffer)
+	writerIn := make(chan any, writerBuffer)
+	signals := make(chan signal.Signal, signalBuffer)
+	batches := make(chan signal.Batch, batchBuffer)
+	changed := make(chan struct{}, 1)
+	symbols := func() []string { return store.Current().Symbols }
+
+	stream := binance.NewStream(cfg.Binance.WSURL, rest, clk, mon.OnConn)
+	router := engine.NewRouter(store, signal.NewGate(clk), signals, clk, warmup(rest, stream, store, clk, log))
+	batcher := signal.NewBatcher(clk, func() config.NotifyConfig { return store.Current().Notify }, batches,
+		func(s signal.Signal) { // every signal, delivered or suppressed, is persisted
+			select {
+			case writerIn <- s:
+			case <-gctx.Done():
+			}
+		})
+	writer := storage.NewWriterWithSink(st, writerBatch, writerFlush)
+	writer.Clock = clk
+	writer.OnDrop = func(n int) {
+		mon.Alert(notify.Message{Title: "落库丢弃", Level: config.LevelWarn,
+			Lines: []string{fmt.Sprintf("数据库写入跟不上，已丢弃 %d 条（累计 %d）", n, writer.Dropped())}})
+	}
+
+	mon.SetSymbols(active.Symbols)
+	var fanBlocked atomic.Int64
+	registerMetrics(mon, router, writer, disp, cfg)
+
+	ln, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("http listen: %w", err)
+	}
+	srv := &http.Server{Handler: mon.Handler(), ReadHeaderTimeout: 5 * time.Second}
+
+	g.Go(func() error {
+		return config.Watch(gctx, cfgPath, raw, func(err error) {
+			log.Error("config reload failed, keeping the previous config", "err", err)
+			mon.Alert(notify.Message{Title: "配置无效", Level: config.LevelCritical,
+				Lines: []string{"配置文件热加载失败，继续使用旧配置", err.Error()}})
+		})
+	})
+	g.Go(func() error {
+		reloadLoop(gctx, raw, store, rest, have, mon, changed, log)
+		return nil
+	})
+	g.Go(func() error { return ignoreCancel(stream.Run(gctx, symbols, changed, events)) })
+	g.Go(func() error { return ignoreCancel(binance.PollContract(gctx, rest, symbols, pollEvery, events, clk)) })
+	g.Go(func() error {
+		fanOut(gctx, events, routerIn, writerIn, mon, &fanBlocked)
+		return nil
+	})
+	g.Go(func() error { return router.Run(gctx, routerIn) })
+	g.Go(func() error { return batcher.Run(gctx, signals) })
+	g.Go(func() error { return disp.Run(gctx, batches) })
+	g.Go(func() error { return writer.Run(gctx, writerIn) })
+	g.Go(func() error { return mon.Run(gctx) })
+	g.Go(func() error {
+		select {
+		case <-gctx.Done():
+			return nil
+		case <-clk.After(connectDeadline):
+		}
+		if !mon.Snapshot().Started {
+			log.Error("binance websocket has not connected since start", "after", connectDeadline)
+			mon.Alert(notify.Message{Title: "WS 未连接", Level: config.LevelCritical,
+				Lines: []string{"启动 " + connectDeadline.String() + " 后仍未连上币安 WebSocket"}})
+		}
+		return nil
+	})
+	g.Go(func() error {
+		logStats(gctx, clk, router, &fanBlocked, log)
+		return nil
+	})
+	g.Go(func() error {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		<-gctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(sctx); err != nil {
+			log.Warn("http shutdown", "err", err)
+		}
+		return nil
+	})
+
+	log.Info("traderbot started", "symbols", active.Symbols, "intervals", active.Intervals,
+		"rules", len(active.Rules), "channels", len(active.Channels), "http", ln.Addr().String())
+	return g.Wait()
+}
+
+func ignoreCancel(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func newDispatcher(cfg *config.Config, hc *http.Client, clk clock.Clock) (*notify.Dispatcher, error) {
+	ns := make(map[string]notify.Notifier, len(cfg.Channels))
+	fallback := map[string]string{}
+	for name, ch := range cfg.Channels {
+		n, err := notify.NewFromConfig(name, ch, hc)
+		if err != nil {
+			return nil, err
+		}
+		ns[name] = n
+		if ch.Fallback != "" {
+			fallback[name] = ch.Fallback
+		}
+	}
+	return notify.NewDispatcher(ns, fallback, 0, clk), nil
+}
+
+func exchangeSymbols(ctx context.Context, rest *binance.REST) (map[string]bool, error) {
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return rest.Symbols(sctx)
+}
+
+// filterSymbols returns a copy of c whose watch pool holds only symbols in
+// have (upper-cased, de-duplicated) and whose rule symbol lists are
+// upper-cased to match, plus the dropped symbols. c is not modified.
+func filterSymbols(c *config.Config, have map[string]bool) (*config.Config, []string) {
+	ok, dropped := binance.ValidateSymbols(c.Symbols, have)
+	out := *c
+	out.Symbols = ok
+	out.Rules = make([]config.Rule, len(c.Rules))
+	for i, r := range c.Rules {
+		syms := make([]string, len(r.Symbols))
+		for j, s := range r.Symbols {
+			if s == config.AllSymbols {
+				syms[j] = s
+			} else {
+				syms[j] = strings.ToUpper(strings.TrimSpace(s))
+			}
+		}
+		r.Symbols = syms
+		out.Rules[i] = r
+	}
+	return &out, dropped
+}
+
+func droppedMessage(dropped []string) notify.Message {
+	return notify.Message{Title: "币种已忽略", Level: config.LevelWarn,
+		Lines: []string{"以下币种不是可交易的 U 本位永续合约，已忽略: " + strings.Join(dropped, ", ")}}
+}
+
+// reloadLoop applies each config published by config.Watch: it re-validates
+// the symbols, publishes the result to store, resubscribes the stream and
+// updates the health monitor when the pool changed. Notification channels,
+// the database DSN and the Binance URLs are fixed at startup: a change to
+// them is logged and takes effect only after a restart.
+func reloadLoop(ctx context.Context, raw, store *config.Store, rest *binance.REST, have map[string]bool,
+	mon *health.Monitor, changed chan<- struct{}, log *slog.Logger) {
+	sub := raw.Subscribe()
+	for {
+		var c *config.Config
+		select {
+		case <-ctx.Done():
+			return
+		case c = <-sub:
+		}
+		if fresh, err := exchangeSymbols(ctx, rest); err == nil {
+			have = fresh
+		} else if ctx.Err() == nil {
+			log.Warn("config reload: exchangeInfo failed, validating symbols against the cached list", "err", err)
+		}
+		next, dropped := filterSymbols(c, have)
+		if len(next.Symbols) == 0 {
+			log.Error("config reload: no tradable symbol left, keeping the previous config", "symbols", c.Symbols)
+			mon.Alert(notify.Message{Title: "配置无效", Level: config.LevelCritical,
+				Lines: []string{"热加载后的配置中没有可交易的币种，继续使用旧配置"}})
+			continue
+		}
+		if len(dropped) > 0 {
+			log.Warn("config reload: ignoring symbols that are not tradable USDT perpetuals", "dropped", dropped)
+			mon.Alert(droppedMessage(dropped)) // rate-limited: reloads can be frequent
+		}
+		prev := store.Current()
+		if !reflect.DeepEqual(prev.Channels, next.Channels) {
+			log.Warn("config reload: notification channel changes take effect only after a restart")
+		}
+		if prev.Database != next.Database || prev.Binance != next.Binance {
+			log.Warn("config reload: database/binance changes take effect only after a restart")
+		}
+		store.Set(next)
+		if !slices.Equal(prev.Symbols, next.Symbols) {
+			mon.SetSymbols(next.Symbols)
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		}
+		log.Info("config reloaded", "symbols", next.Symbols, "rules", len(next.Rules))
+	}
+}
+
+// warmupPlan returns how many bars to fetch per interval: warmupBars for every
+// configured interval, and enough 1m bars to rebuild the current bucket of
+// the largest interval (largest/1m, capped at maxWarmup1m) (R15).
+func warmupPlan(ivs []market.Interval) map[market.Interval]int {
+	plan := map[market.Interval]int{}
+	var largest time.Duration
+	for _, iv := range ivs {
+		if iv.Valid() {
+			plan[iv] = warmupBars
+			largest = max(largest, iv.Duration())
+		}
+	}
+	if n := min(int(largest/time.Minute), maxWarmup1m); n > plan[market.I1m] {
+		plan[market.I1m] = n
+	}
+	return plan
+}
+
+// warmup returns the Router's history func: REST bars per warmupPlan, bounded
+// by warmupTimeout. The 1m bars are fetched first and seed the stream's gap
+// detection with the last closed bar.
+func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk clock.Clock, log *slog.Logger) engine.HistoryFunc {
+	return func(ctx context.Context, symbol string) (map[market.Interval][]market.Kline, error) {
+		ctx, cancel := context.WithTimeout(ctx, warmupTimeout)
+		defer cancel()
+		plan := warmupPlan(store.Current().Intervals)
+		ivs := make([]market.Interval, 0, len(plan))
+		for iv := range plan {
+			ivs = append(ivs, iv)
+		}
+		sort.Slice(ivs, func(i, j int) bool { return ivs[i].Duration() < ivs[j].Duration() })
+
+		now := clk.Now()
+		out := make(map[market.Interval][]market.Kline, len(plan))
+		total := 0
+		for _, iv := range ivs {
+			n, d := plan[iv], iv.Duration()
+			start := now.Truncate(d).Add(-time.Duration(n) * d)
+			ks, err := rest.Klines(ctx, symbol, iv, start, n)
+			if err != nil {
+				return nil, fmt.Errorf("warmup %s %s: %w", symbol, iv, err)
+			}
+			out[iv] = ks
+			total += len(ks)
+			if iv == market.I1m {
+				for i := len(ks) - 1; i >= 0; i-- {
+					if ks[i].Closed {
+						stream.Seed(symbol, ks[i].OpenTime)
+						break
+					}
+				}
+			}
+		}
+		log.Info("warmup done", "symbol", symbol, "bars", total)
+		return out, nil
+	}
+}
+
+// fanOut forwards every market event to the Router (never dropped; a full
+// router input blocks and is counted), the Writer and the health Monitor.
+// It must keep draining in, or the Binance stream stalls.
+func fanOut(ctx context.Context, in <-chan market.Event, router chan<- market.Event, writer chan<- any,
+	mon *health.Monitor, blocked *atomic.Int64) {
+	for {
+		var ev market.Event
+		select {
+		case <-ctx.Done():
+			return
+		case ev = <-in:
+		}
+		mon.OnEvent(ev.EventSymbol())
+		select {
+		case router <- ev:
+		default:
+			blocked.Add(1)
+			select {
+			case router <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+		select {
+		case writer <- ev:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// logStats logs a warning whenever the event path had to wait since the last
+// check (router input full, or a worker's channel full).
+func logStats(ctx context.Context, clk clock.Clock, router *engine.Router, fanBlocked *atomic.Int64, log *slog.Logger) {
+	var lastRouter, lastFan int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-clk.After(statsEvery):
+		}
+		r, f := router.Backpressure(), fanBlocked.Load()
+		if r > lastRouter || f > lastFan {
+			log.Warn("event pipeline backpressure", "worker_waits", r-lastRouter, "router_input_waits", f-lastFan,
+				"worker_waits_total", r, "router_input_waits_total", f)
+		}
+		lastRouter, lastFan = r, f
+	}
+}
+
+func registerMetrics(mon *health.Monitor, router *engine.Router, writer *storage.Writer, disp *notify.Dispatcher, cfg *config.Config) {
+	mon.RegisterCounterFunc("traderbot_router_backpressure_total",
+		"Times a market event waited for a full per-symbol worker channel.",
+		func() float64 { return float64(router.Backpressure()) })
+	mon.RegisterCounterFunc("traderbot_writer_dropped_total",
+		"Items dropped by the storage writer because its buffer was full.",
+		func() float64 { return float64(writer.Dropped()) })
+	names := make([]string, 0, len(cfg.Channels))
+	for name := range cfg.Channels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		mon.Registry().MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "traderbot_dispatcher_dropped_total",
+			Help:        "Notifications dropped because the channel queue was full.",
+			ConstLabels: prometheus.Labels{"channel": name},
+		}, func() float64 { return float64(disp.Dropped(name)) }))
+	}
+}
+
+// healthcheckURL turns a listen address into the local /healthz URL.
+func healthcheckURL(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/healthz", nil
+}
+
+// probe is the -healthcheck mode: 0 if /healthz answers 200, else 1.
+func probe(addr string) int {
+	u, err := healthcheckURL(addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get(u)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "healthcheck: status", resp.StatusCode)
+		return 1
+	}
+	return 0
+}
+
+// discardStore is the -no-db sink: every write succeeds and is thrown away.
+type discardStore struct{}
+
+func (discardStore) WriteKlines(context.Context, []market.Kline) error                  { return nil }
+func (discardStore) WriteMarkPrices(context.Context, []market.MarkPriceEvent) error     { return nil }
+func (discardStore) WriteOI(context.Context, []market.OpenInterestEvent) error          { return nil }
+func (discardStore) WriteLongShort(context.Context, []market.LongShortEvent) error      { return nil }
+func (discardStore) WriteLiquidations(context.Context, []market.LiquidationEvent) error { return nil }
+func (discardStore) WriteSignals(context.Context, []signal.Signal) error                { return nil }
+func (discardStore) Close()                                                             {}

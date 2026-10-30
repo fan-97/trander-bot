@@ -34,7 +34,7 @@ channels:
   discord:
     type: discord
     params:
-      webhook_url: ${DISCORD_WEBHOOK_URL}
+      url: ${DISCORD_WEBHOOK_URL}
 
 notify:
   merge_window: 10s
