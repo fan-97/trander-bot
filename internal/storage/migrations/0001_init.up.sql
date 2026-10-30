@@ -1,6 +1,6 @@
--- Lines between "-- timescale:begin" and "-- timescale:end" are skipped when
--- TB_SKIP_TIMESCALE=1 (integration runs against plain Postgres only).
--- Production always applies them.
+-- Blocks between "-- timescale:begin" and "-- timescale:end" are stripped only
+-- by the integration test harness (TB_SKIP_TIMESCALE=1 in TestMain) so the
+-- schema can be exercised on plain PostgreSQL. Production always applies them.
 
 -- timescale:begin
 CREATE EXTENSION IF NOT EXISTS timescaledb;
@@ -69,12 +69,19 @@ CREATE INDEX signals_time_idx ON signals (time);
 CREATE INDEX signals_rule_id_time_idx ON signals (rule_id, time);
 
 -- timescale:begin
-SELECT create_hypertable('klines', 'open_time', if_not_exists => TRUE);
-SELECT create_hypertable('mark_prices', 'time', if_not_exists => TRUE);
-SELECT create_hypertable('open_interest', 'time', if_not_exists => TRUE);
-SELECT create_hypertable('long_short', 'time', if_not_exists => TRUE);
-SELECT create_hypertable('liquidations', 'time', if_not_exists => TRUE);
+-- No default time indexes: every PK already contains the time
+-- column, and liquidations has its own (symbol, time DESC) index, so the
+-- index set matches the plain-Postgres test schema exactly.
+SELECT create_hypertable('klines', 'open_time', if_not_exists => TRUE, create_default_indexes => FALSE);
+SELECT create_hypertable('mark_prices', 'time', if_not_exists => TRUE, create_default_indexes => FALSE);
+SELECT create_hypertable('open_interest', 'time', if_not_exists => TRUE, create_default_indexes => FALSE);
+SELECT create_hypertable('long_short', 'time', if_not_exists => TRUE, create_default_indexes => FALSE);
+SELECT create_hypertable('liquidations', 'time', if_not_exists => TRUE, create_default_indexes => FALSE);
 
-ALTER TABLE klines SET (timescaledb.compress, timescaledb.compress_segmentby = 'symbol');
+ALTER TABLE klines SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'symbol, interval',
+    timescaledb.compress_orderby = 'open_time DESC'
+);
 SELECT add_compression_policy('klines', INTERVAL '7 days');
 -- timescale:end

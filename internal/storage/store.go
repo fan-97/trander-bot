@@ -2,16 +2,13 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"strconv"
 	"strings"
-	"testing/fstest"
 
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -27,11 +24,10 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// SkipTimescaleEnv, when set to "1", makes Open strip the blocks between
-// "-- timescale:begin" and "-- timescale:end" from every migration. It exists
-// only so integration tests can run against plain PostgreSQL; production
-// always applies the Timescale statements.
-const SkipTimescaleEnv = "TB_SKIP_TIMESCALE"
+// migrationSource is the migration FS Open applies. Production always uses
+// the embedded files; integration tests may swap in a copy without the
+// Timescale blocks (see testmain_integration_test.go).
+var migrationSource fs.FS = migrationsFS
 
 // maxParams is PostgreSQL's limit on bind parameters per statement.
 const maxParams = 65535
@@ -43,7 +39,7 @@ type Store struct {
 
 // Open connects to dsn, applies all pending migrations and returns a Store.
 func Open(ctx context.Context, dsn string) (*Store, error) {
-	if err := migrateUp(dsn, os.Getenv(SkipTimescaleEnv) == "1"); err != nil {
+	if err := migrateUp(ctx, dsn); err != nil {
 		return nil, err
 	}
 	pool, err := pgxpool.New(ctx, dsn)
@@ -60,73 +56,48 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // Close releases the connection pool.
 func (s *Store) Close() { s.pool.Close() }
 
-func migrateUp(dsn string, skipTimescale bool) error {
+// migrateUp applies pending migrations. golang-migrate has no context
+// support, so Up runs on its own goroutine; if ctx ends first, Open signals
+// GracefulStop (migrate stops before the next migration) and returns
+// ctx.Err() at once. A statement already executing is not interrupted; the
+// goroutine finishes it and then closes its own database handle.
+func migrateUp(ctx context.Context, dsn string) error {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return fmt.Errorf("storage: parse dsn: %w", err)
 	}
-	src, err := migrationSource(skipTimescale)
-	if err != nil {
-		return err
-	}
-	srcDrv, err := iofs.New(src, "migrations")
+	srcDrv, err := iofs.New(migrationSource, "migrations")
 	if err != nil {
 		return fmt.Errorf("storage: migration source: %w", err)
 	}
 	db := stdlib.OpenDB(*cfg)
-	defer db.Close()
 	dbDrv, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
 	if err != nil {
+		db.Close()
 		return fmt.Errorf("storage: migrate driver: %w", err)
 	}
 	m, err := migrate.NewWithInstance("iofs", srcDrv, "pgx5", dbDrv)
 	if err != nil {
+		db.Close()
 		return fmt.Errorf("storage: migrate: %w", err)
 	}
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("storage: migrate up: %w", err)
-	}
-	return nil
-}
-
-// migrationSource returns the embedded migrations, or a copy with the
-// Timescale blocks removed.
-func migrationSource(skipTimescale bool) (fs.FS, error) {
-	if !skipTimescale {
-		return migrationsFS, nil
-	}
-	ents, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return nil, err
-	}
-	out := fstest.MapFS{}
-	for _, e := range ents {
-		b, err := migrationsFS.ReadFile("migrations/" + e.Name())
-		if err != nil {
-			return nil, err
+	done := make(chan error, 1)
+	go func() {
+		err := m.Up()
+		m.Close()
+		db.Close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, migrate.ErrNoChange) {
+			return fmt.Errorf("storage: migrate up: %w", err)
 		}
-		out["migrations/"+e.Name()] = &fstest.MapFile{Data: stripTimescale(b), Mode: 0o444}
+		return nil
+	case <-ctx.Done():
+		m.GracefulStop <- true
+		return fmt.Errorf("storage: migrate up: %w", ctx.Err())
 	}
-	return out, nil
-}
-
-// stripTimescale drops every line from "-- timescale:begin" through
-// "-- timescale:end" inclusive.
-func stripTimescale(b []byte) []byte {
-	var out bytes.Buffer
-	skip := false
-	for _, line := range bytes.SplitAfter(b, []byte("\n")) {
-		t := strings.TrimSpace(string(line))
-		switch {
-		case t == "-- timescale:begin":
-			skip = true
-		case t == "-- timescale:end":
-			skip = false
-		case !skip:
-			out.Write(line)
-		}
-	}
-	return out.Bytes()
 }
 
 // insertRows runs "head VALUES (...),(...) tail" for n rows of cols columns,
@@ -273,6 +244,9 @@ func (s *Store) WriteSignals(ctx context.Context, ss []signal.Signal) error {
 // RecentKlines returns the newest n stored (closed) bars for symbol/interval
 // in ascending open-time order.
 func (s *Store) RecentKlines(ctx context.Context, symbol string, interval market.Interval, n int) ([]market.Kline, error) {
+	if n <= 0 {
+		return []market.Kline{}, nil
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT open_time, open, high, low, close, volume, quote_volume FROM (
 			SELECT * FROM klines WHERE symbol = $1 AND interval = $2
@@ -282,7 +256,7 @@ func (s *Store) RecentKlines(ctx context.Context, symbol string, interval market
 		return nil, fmt.Errorf("storage: recent klines: %w", err)
 	}
 	defer rows.Close()
-	out := make([]market.Kline, 0, min(max(n, 0), 1024))
+	out := make([]market.Kline, 0, min(n, 1024))
 	for rows.Next() {
 		k := market.Kline{Symbol: symbol, Interval: interval, Closed: true}
 		if err := rows.Scan(&k.OpenTime, &k.Open, &k.High, &k.Low, &k.Close, &k.Volume, &k.QuoteVolume); err != nil {

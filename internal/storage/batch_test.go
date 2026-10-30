@@ -31,9 +31,21 @@ type fakeSink struct {
 	ctxErrs     []error
 	failSignals int
 	gate        chan struct{}
+	block       chan struct{} // like gate but settable mid-test (under mu)
+	entered     int
 }
 
 func (f *fakeSink) enter(ctx context.Context) {
+	f.mu.Lock()
+	f.entered++
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+	}
 	if f.gate != nil {
 		select {
 		case <-f.gate:
@@ -333,19 +345,78 @@ func TestWriterUnit_SlowSinkDoesNotBlockReceive(t *testing.T) {
 	eventually(t, "all written", func() bool { return len(fs.snapshotSigs()) == n })
 }
 
-func TestStripTimescale(t *testing.T) {
-	in := "A;\n-- timescale:begin\nCREATE EXTENSION x;\n-- timescale:end\nB;\n"
-	if got := string(stripTimescale([]byte(in))); got != "A;\nB;\n" {
-		t.Fatalf("stripTimescale = %q", got)
+func TestWriterUnit_HungFlushStillDropsOldest(t *testing.T) {
+	fs := &fakeSink{failSignals: 1}
+	clk := clock.NewFake(t0)
+	r := start(t, fs, 500, time.Hour, clk)
+	for i := 0; i < 500; i++ {
+		r.in <- sig(i)
 	}
-	up, err := migrationsFS.ReadFile("migrations/0001_init.up.sql")
-	if err != nil {
-		t.Fatal(err)
+	eventually(t, "failing flush", func() bool { return fs.sigCallCount() == 1 })
+	// Failure pauses size flushes, so the buffer fills to the cap.
+	for i := 500; i < maxBuffered; i++ {
+		r.in <- sig(i)
 	}
-	if !strings.Contains(string(up), "create_hypertable") || !strings.Contains(string(up), "add_compression_policy") {
-		t.Fatal("production migration lost its Timescale statements")
+	release := make(chan struct{})
+	fs.mu.Lock()
+	fs.block = release
+	before := fs.entered
+	fs.mu.Unlock()
+	clk.Advance(time.Hour) // tick: retry starts and hangs
+	eventually(t, "hung flush", func() bool { fs.mu.Lock(); defer fs.mu.Unlock(); return fs.entered > before })
+	const extra = 500
+	for i := maxBuffered; i < maxBuffered+extra; i++ {
+		r.in <- sig(i)
 	}
-	if s := string(stripTimescale(up)); strings.Contains(strings.ToLower(s), "timescaledb") || strings.Contains(s, "hypertable") {
-		t.Fatalf("stripped migration still references Timescale:\n%s", s)
+	// Only the oldest batchSize items (0..499) are in flight; the next-oldest
+	// buffered ones (500..999) must be dropped, and the newest 500 kept.
+	eventually(t, "drop count", func() bool { return r.w.Dropped() == extra })
+	fs.mu.Lock()
+	fs.block = nil
+	fs.mu.Unlock()
+	close(release)
+	r.stop(t)
+	got := map[float64]bool{}
+	for _, s := range fs.sigs {
+		got[s.Price] = true
+	}
+	for i := maxBuffered; i < maxBuffered+extra; i++ {
+		if !got[float64(i)] {
+			t.Fatalf("newest item %d was not retained", i)
+		}
+	}
+	for i := 500; i < 1000; i++ {
+		if got[float64(i)] {
+			t.Fatalf("old item %d should have been dropped", i)
+		}
+	}
+	if len(fs.sigs) != maxBuffered {
+		t.Fatalf("written = %d, want %d", len(fs.sigs), maxBuffered)
+	}
+}
+
+func TestWriterUnit_ClosedInput(t *testing.T) {
+	fs := &fakeSink{}
+	clk := clock.NewFake(t0)
+	r := start(t, fs, 500, time.Second, clk)
+	r.in <- sig(1)
+	close(r.in)
+	eventually(t, "tick flush after close", func() bool {
+		clk.Advance(time.Second)
+		return len(fs.snapshotSigs()) == 1
+	})
+	r.stop(t)
+}
+
+func TestWriterUnit_FinalFlushLossCountsAsDropped(t *testing.T) {
+	fs := &fakeSink{failSignals: 1}
+	r := start(t, fs, 500, time.Hour, clock.NewFake(t0))
+	var hook int
+	r.w.OnDrop = func(n int) { hook += n } // Run's goroutine only; read after stop
+	r.in <- sig(1)
+	r.in <- sig(2)
+	r.stop(t)
+	if r.w.Dropped() != 2 || hook != 2 {
+		t.Fatalf("Dropped = %d, OnDrop total = %d, want 2", r.w.Dropped(), hook)
 	}
 }

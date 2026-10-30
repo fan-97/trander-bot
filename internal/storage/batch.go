@@ -44,7 +44,7 @@ type Writer struct {
 	// Clock drives the flush interval. Defaults to clock.Real.
 	Clock clock.Clock
 	// OnDrop, if set, is called (from Run's goroutine) with the number of
-	// items just dropped because the buffer was full.
+	// items just dropped because the buffer was full or lost in the final flush.
 	OnDrop func(n int)
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
@@ -74,8 +74,10 @@ func (w *Writer) Dropped() int64 { return w.dropped.Load() }
 // Run consumes in until ctx ends (a closed in just stops receiving), then performs a final flush with a fresh
 // timeout and returns nil. Closed klines, one mark price per symbol per
 // minute, OI, long/short, liquidations and signals are stored; anything else
-// is ignored. Flushes run on a separate goroutine, at most one at a time, so
-// a slow database never blocks receiving. A failed flush keeps its items for
+// is ignored. Flushes run on a separate goroutine, at most one at a time and
+// at most batchSize items each, so a slow database never blocks receiving and
+// overflow always drops the oldest buffered items. Drops are logged as one
+// summary per tick; items lost in the final flush also count as dropped. A failed flush keeps its items for
 // the next one; a failure also pauses size-triggered flushes until the next
 // interval tick so a down database is not retried in a tight loop.
 func (w *Writer) Run(ctx context.Context, in <-chan any) error {
@@ -94,16 +96,33 @@ func (w *Writer) Run(ctx context.Context, in <-chan any) error {
 		results  = make(chan []any) // failed items of the finished flush
 		lastMark = map[string]time.Time{}
 		failing  bool
+		unlogged int64 // drops not yet reported in the per-tick summary
 		tick     = clk.After(w.flushEvery)
 	)
 
+	drop := func(n int) {
+		w.dropped.Add(int64(n))
+		unlogged += int64(n)
+		if w.OnDrop != nil {
+			w.OnDrop(n)
+		}
+	}
+	logDrops := func() {
+		if unlogged > 0 {
+			log.Warn("storage: writer buffer full, dropped oldest", "dropped", unlogged, "total", w.dropped.Load())
+			unlogged = 0
+		}
+	}
+	// startFlush hands the oldest batchSize items to a flush goroutine. The
+	// rest stay in buf, where trim can still drop the oldest of them.
 	startFlush := func() {
 		if inflight > 0 || len(buf) == 0 {
 			return
 		}
-		batch := buf
-		buf = nil
-		inflight = len(batch)
+		n := min(len(buf), w.batchSize)
+		batch := append([]any(nil), buf[:n]...)
+		buf = buf[n:]
+		inflight = n
 		go func() {
 			fctx, cancel := context.WithTimeout(ctx, flushTimeout)
 			defer cancel()
@@ -114,11 +133,7 @@ func (w *Writer) Run(ctx context.Context, in <-chan any) error {
 		if over := inflight + len(buf) - maxBuffered; over > 0 {
 			over = min(over, len(buf))
 			buf = buf[over:] // append reallocates as cap shrinks, releasing the old array
-			w.dropped.Add(int64(over))
-			log.Warn("storage: writer buffer full, dropped oldest", "n", over, "total", w.dropped.Load())
-			if w.OnDrop != nil {
-				w.OnDrop(over)
-			}
+			drop(over)
 		}
 	}
 	finish := func(failed []any) {
@@ -139,10 +154,12 @@ func (w *Writer) Run(ctx context.Context, in <-chan any) error {
 			if len(buf) > 0 {
 				fctx, cancel := context.WithTimeout(context.Background(), finalFlushTimeout)
 				if lost := w.flush(fctx, log, buf); len(lost) > 0 {
+					drop(len(lost))
 					log.Error("storage: final flush failed, items lost", "n", len(lost))
 				}
 				cancel()
 			}
+			logDrops()
 			return nil
 		case failed := <-results:
 			finish(failed)
@@ -152,6 +169,7 @@ func (w *Writer) Run(ctx context.Context, in <-chan any) error {
 		case <-tick:
 			tick = clk.After(w.flushEvery)
 			failing = false
+			logDrops()
 			startFlush()
 		case v, open := <-in:
 			if !open {

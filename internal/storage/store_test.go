@@ -234,3 +234,13 @@ func TestStore_BigKlineBatch(t *testing.T) {
 		t.Fatalf("rows = %d", n)
 	}
 }
+
+func TestStore_RecentKlinesNonPositive(t *testing.T) {
+	s := openTest(t)
+	for _, n := range []int{0, -1} {
+		got, err := s.RecentKlines(context.Background(), "BTCUSDT", market.I1m, n)
+		if err != nil || got == nil || len(got) != 0 {
+			t.Fatalf("n=%d: got %v, %v; want empty, nil", n, got, err)
+		}
+	}
+}
