@@ -54,6 +54,7 @@ type Stream struct {
 	stableAfter time.Duration
 	readTimeout time.Duration
 	rotateAfter time.Duration
+	fillTimeout time.Duration
 
 	emitMu     sync.Mutex
 	lastClosed map[string]time.Time // last emitted closed 1m OpenTime per symbol
@@ -86,6 +87,7 @@ func NewStream(wsURL string, rest *REST, clk clock.Clock, onState func(connected
 		stableAfter: time.Minute,
 		readTimeout: 3 * time.Minute,
 		rotateAfter: 23 * time.Hour,
+		fillTimeout: 10 * time.Second,
 		lastClosed:  make(map[string]time.Time),
 	}
 }
@@ -402,7 +404,8 @@ func (s *Stream) serve(ctx context.Context, cur *conn, u string, rotate, watch <
 
 // gapFill runs after each (re)connect: for every symbol with a known last
 // closed bar it emits the bars that closed safely (closeMargin) before now.
-// One attempt only; a failure is caught later by hole detection in forward.
+// One bounded attempt only; a failure is caught later by hole detection in
+// forward.
 func (s *Stream) gapFill(ctx context.Context, syms []string, out chan<- market.Event) {
 	if s.rest == nil {
 		return
@@ -419,17 +422,43 @@ func (s *Stream) gapFill(ctx context.Context, syms []string, out chan<- market.E
 	}
 }
 
+// errIncomplete reports a fill whose REST answer ended before the requested
+// range.
+type errIncomplete struct{ upTo, want time.Time }
+
+func (e *errIncomplete) Error() string {
+	return fmt.Sprintf("incomplete: filled up to %s of %s", e.upTo.Format(time.RFC3339), e.want.Format(time.RFC3339))
+}
+
+// withClockTimeout returns ctx bounded by d both in real time (a deadline,
+// which REST uses to fail fast under a long pause) and on s.clk.
+func (s *Stream) withClockTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	tctx, cancel := context.WithTimeout(ctx, d)
+	fire := s.clk.After(d)
+	go func() {
+		select {
+		case <-fire:
+			cancel()
+		case <-tctx.Done():
+		}
+	}()
+	return tctx, cancel
+}
+
 // fillLocked emits, in order, the closed 1m bars of sym after its last closed
-// bar that ended at or before until, fetched over REST. It returns an error
-// if the REST call fails or the range is not completely covered. emitMu must
-// be held.
+// bar that ended at or before until, fetched over REST in one attempt bounded
+// by fillTimeout. It returns an error if the REST call fails or the range is
+// not completely covered (*errIncomplete). emitMu must be held, which is why
+// the attempt is bounded: every shard waits on this lock.
 func (s *Stream) fillLocked(ctx context.Context, sym string, until time.Time, out chan<- market.Event) error {
 	start := s.lastClosed[sym].Add(time.Minute)
 	n := int(until.Sub(start) / time.Minute) // bars ending at or before until
 	if n <= 0 {
 		return nil
 	}
-	ks, err := s.rest.Klines(ctx, sym, market.I1m, start, n)
+	fctx, cancel := s.withClockTimeout(ctx, s.fillTimeout)
+	ks, err := s.rest.Klines(fctx, sym, market.I1m, start, n)
+	cancel()
 	if err != nil {
 		return err
 	}
@@ -439,9 +468,9 @@ func (s *Stream) fillLocked(ctx context.Context, sym string, until time.Time, ou
 			s.emitLocked(ctx, market.KlineEvent{Kline: k}, out)
 		}
 	}
-	if got := s.lastClosed[sym]; got.Add(time.Minute).Before(start.Add(time.Duration(n) * time.Minute)) {
-		return fmt.Errorf("incomplete: filled up to %s of %s", got.Add(time.Minute).Format(time.RFC3339),
-			start.Add(time.Duration(n)*time.Minute).Format(time.RFC3339))
+	want := start.Add(time.Duration(n) * time.Minute)
+	if got := s.lastClosed[sym].Add(time.Minute); got.Before(want) {
+		return &errIncomplete{upTo: got, want: want}
 	}
 	return nil
 }
@@ -450,9 +479,10 @@ func (s *Stream) fillLocked(ctx context.Context, sym string, until time.Time, ou
 var holeRetryWaits = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 
 // fillHoleLocked fills the bars between the last closed bar of sym and a live
-// closed bar opening at next, retrying with holeRetryWaits. If every attempt
-// fails the hole is logged at Error and accepted, so live data never stalls.
-// emitMu must be held.
+// closed bar opening at next: up to 1+len(holeRetryWaits) attempts of at most
+// fillTimeout each, so emitMu is held for at most 4×10s + 7s. Under a REST
+// rate-limit pause it gives up at once. If the hole stays, it is logged and
+// accepted, so live data never stalls. emitMu must be held.
 func (s *Stream) fillHoleLocked(ctx context.Context, sym string, next time.Time, out chan<- market.Event) {
 	from := s.lastClosed[sym].Add(time.Minute)
 	var err error
@@ -461,7 +491,8 @@ func (s *Stream) fillHoleLocked(ctx context.Context, sym string, next time.Time,
 			err = errors.New("no REST client")
 			break
 		}
-		if err = s.fillLocked(ctx, sym, next, out); err == nil || ctx.Err() != nil || attempt >= len(holeRetryWaits) {
+		err = s.fillLocked(ctx, sym, next, out)
+		if err == nil || ctx.Err() != nil || errors.Is(err, ErrPaused) || attempt >= len(holeRetryWaits) {
 			break
 		}
 		s.log().Warn("binance stream: hole fill failed, retrying", "symbol", sym, "err", err, "retry_in", holeRetryWaits[attempt])
@@ -470,10 +501,18 @@ func (s *Stream) fillHoleLocked(ctx context.Context, sym string, next time.Time,
 		case <-s.clk.After(holeRetryWaits[attempt]):
 		}
 	}
-	if err != nil && ctx.Err() == nil {
-		s.log().Error("binance stream: could not fill missing 1m bars, continuing with live data",
-			"symbol", sym, "from", from, "to", next.Add(-time.Minute), "err", err)
+	if err == nil || ctx.Err() != nil {
+		return
 	}
+	var inc *errIncomplete
+	if errors.As(err, &inc) && !s.lastClosed[sym].Before(from) {
+		// Most bars came back; the tail is likely an exchange-side gap.
+		s.log().Warn("binance stream: hole only partly filled, continuing with live data",
+			"symbol", sym, "from", from, "to", next.Add(-time.Minute), "err", err)
+		return
+	}
+	s.log().Error("binance stream: could not fill missing 1m bars, continuing with live data",
+		"symbol", sym, "from", from, "to", next.Add(-time.Minute), "err", err)
 }
 
 func (s *Stream) handle(ctx context.Context, b []byte, out chan<- market.Event) {

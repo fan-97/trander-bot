@@ -111,7 +111,13 @@ func (b *bucket) refill(now time.Time) {
 	}
 }
 
-// acquire blocks until weight tokens are available or ctx is done.
+// ErrPaused is returned instead of waiting when the shared 429/418 pause
+// lasts beyond the caller's context deadline.
+var ErrPaused = errors.New("binance: requests paused after rate limit (429/418)")
+
+// acquire blocks until weight tokens are available or ctx is done. A caller
+// whose ctx deadline comes before the end of a 429/418 pause gets ErrPaused
+// at once rather than sleeping into its deadline.
 func (b *bucket) acquire(ctx context.Context, clk clock.Clock, weight int) error {
 	w := float64(weight)
 	if w > b.capacity {
@@ -123,6 +129,9 @@ func (b *bucket) acquire(ctx context.Context, clk clock.Clock, weight int) error
 		if now.Before(b.pauseUntil) {
 			wait := b.pauseUntil.Sub(now)
 			b.mu.Unlock()
+			if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait {
+				return fmt.Errorf("%w for another %v", ErrPaused, wait)
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()

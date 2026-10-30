@@ -171,7 +171,7 @@ func newWSServer(t *testing.T) *wsServer {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	ws.url = "ws" + strings.TrimPrefix(srv.URL, "http")
+	ws.url = "ws" + strings.TrimPrefix(srv.URL, "http") + "/market"
 	return ws
 }
 
@@ -610,5 +610,84 @@ func TestNewStream_WarnsOnEmptyPath(t *testing.T) {
 	NewStream(DefaultWSURL, nil, nil, nil)
 	if logs.String() != "" {
 		t.Fatalf("unexpected log: %q", logs.String())
+	}
+}
+
+func TestStream_HoleFillUnderLongPauseFailsFast(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		holeRows(w)
+	}, false)
+	var logs syncBuf
+	h.s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	h.s.rest.bucket.pause(h.clk.Now().Add(600 * time.Second)) // e.g. a 429 with Retry-After: 600
+	before := h.clk.Now()
+	sc.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3))
+	wantKline(t, h.event(), m.Add(2*time.Minute), true) // no clock advance needed
+	sc.send(t, klineMsg("BTCUSDT", m.Add(3*time.Minute), false, 4))
+	wantKline(t, h.event(), m.Add(3*time.Minute), false)
+	if !h.clk.Now().Equal(before) || calls.Load() != 0 {
+		t.Fatalf("clock moved %v, rest calls %d", h.clk.Now().Sub(before), calls.Load())
+	}
+	l := logs.String()
+	if !strings.Contains(l, "level=ERROR") || strings.Contains(l, "retrying") {
+		t.Fatalf("want immediate give-up with an error log, got: %s", l)
+	}
+}
+
+func TestStream_HoleFillAttemptTimesOut(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	var calls atomic.Int32
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-r.Context().Done() // hangs until the client gives up
+	}, false)
+	if h.s.fillTimeout != 10*time.Second {
+		t.Fatalf("fillTimeout = %v, want 10s", h.s.fillTimeout)
+	}
+	start := h.clk.Now()
+	sc.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3))
+	waitCalls := func(n int32) {
+		t.Helper()
+		limit := time.After(2 * time.Second)
+		for calls.Load() < n {
+			select {
+			case <-limit:
+				t.Fatalf("rest calls %d, want %d", calls.Load(), n)
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}
+	waitCalls(1)
+	h.clk.Advance(9 * time.Second)
+	h.noEvent()
+	if calls.Load() != 1 {
+		t.Fatalf("attempt ended before 10s: calls %d", calls.Load())
+	}
+	h.clk.Advance(time.Second) // attempt 1 times out, then a 1s back-off
+	waitCalls(1)
+	wantKline(t, h.eventAdvancing(500*time.Millisecond), m.Add(2*time.Minute), true)
+	if calls.Load() != 4 {
+		t.Fatalf("attempts %d", calls.Load())
+	}
+	if el := h.clk.Now().Sub(start); el < 47*time.Second {
+		t.Fatalf("4 timed-out attempts + back-off took only %v", el)
+	}
+}
+
+func TestStream_HolePartlyFilledLogsWarnNotError(t *testing.T) {
+	m := t0.Truncate(time.Minute)
+	h, sc := holeHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "[%s]", klineRow(m, 1)) // 12:01 missing on the exchange
+	}, false)
+	var logs syncBuf
+	h.s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	sc.send(t, klineMsg("BTCUSDT", m.Add(2*time.Minute), true, 3))
+	wantKline(t, h.eventAdvancing(500*time.Millisecond), m, true)
+	wantKline(t, h.eventAdvancing(500*time.Millisecond), m.Add(2*time.Minute), true)
+	if l := logs.String(); strings.Contains(l, "level=ERROR") || !strings.Contains(l, "partly filled") {
+		t.Fatalf("logs: %s", l)
 	}
 }
