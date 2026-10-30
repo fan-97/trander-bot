@@ -48,6 +48,8 @@ type Config struct {
 	Notify    NotifyConfig
 	Database  DatabaseConfig
 	Binance   BinanceConfig
+
+	explicitIntervals bool // Intervals came from YAML, not derived from rules
 }
 
 type Rule struct {

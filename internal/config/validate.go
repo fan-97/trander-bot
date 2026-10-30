@@ -3,12 +3,15 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"gopkg.in/yaml.v3"
-)
 
-func joinErrors(errs []error) error { return errors.Join(errs...) }
+	"trader-bot/internal/market"
+
+	_ "time/tzdata" // QuietHours TZ validation must work in distroless images
+)
 
 var channelTypes = map[string]bool{
 	"telegram": true, "discord": true, "webhook": true, "email": true,
@@ -27,13 +30,21 @@ func (c *Config) Validate() error {
 	for _, s := range c.Symbols {
 		pool[s] = true
 	}
+	hasInterval := map[market.Interval]bool{}
 	for _, i := range c.Intervals {
+		hasInterval[i] = true
 		if !i.Valid() {
 			add("intervals: unknown interval %q", i)
 		}
 	}
 
-	for name, ch := range c.Channels {
+	names := make([]string, 0, len(c.Channels))
+	for name := range c.Channels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ch := c.Channels[name]
 		if !channelTypes[ch.Type] {
 			add("channels.%s: unknown type %q", name, ch.Type)
 		}
@@ -55,6 +66,8 @@ func (c *Config) Validate() error {
 
 		if !r.Interval.Valid() {
 			add("rule %q: unknown interval %q", r.ID, r.Interval)
+		} else if c.explicitIntervals && !hasInterval[r.Interval] {
+			add("rule %q: interval %q not in intervals list", r.ID, r.Interval)
 		}
 		if r.Trigger != TriggerOnClose && r.Trigger != TriggerRealtime {
 			add("rule %q: unknown trigger %q", r.ID, r.Trigger)
@@ -65,7 +78,7 @@ func (c *Config) Validate() error {
 		if r.Cooldown < 0 {
 			add("rule %q: negative cooldown", r.ID)
 		}
-		if r.When.IsZero() || (r.When.Kind == yaml.ScalarNode && r.When.Value == "") {
+		if r.When.IsZero() || r.When.Tag == "!!null" || (r.When.Kind == yaml.ScalarNode && r.When.Value == "") {
 			add("rule %q: missing when", r.ID)
 		}
 		if len(r.Channels) == 0 {

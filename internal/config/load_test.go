@@ -91,3 +91,36 @@ func TestRulesFor_All(t *testing.T) {
 		t.Errorf("ETH: %+v", got)
 	}
 }
+
+const okRule = `{id: a, interval: 5m, when: {all: ["rsi(14) < 30"]}, channels: [tg]}`
+
+func TestParse_BuildAndValidateErrorsTogether(t *testing.T) {
+	_, err := Parse([]byte(`
+symbols: [BTCUSDT]
+channels: {tg: {type: telegram}}
+rules:
+  - {id: a, interval: 5m, cooldown: abc, when: {all: ["x > 1"]}, channels: [tg]}
+  - {id: a, interval: 5m, when: {all: ["x > 1"]}, channels: [tg]}
+`))
+	if err == nil || !strings.Contains(err.Error(), "invalid cooldown") || !strings.Contains(err.Error(), "duplicate rule id") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidate_ExplicitIntervals(t *testing.T) {
+	_, err := Parse([]byte("symbols: [BTCUSDT]\nintervals: [1h, 1h]\nchannels: {tg: {type: telegram}}\nrules: [" + okRule + "]"))
+	if err == nil || !strings.Contains(err.Error(), "not in intervals list") {
+		t.Fatalf("err=%v", err)
+	}
+	c, err := Parse([]byte("symbols: [BTCUSDT]\nintervals: [5m, 5m]\nchannels: {tg: {type: telegram}}\nrules: [" + okRule + "]"))
+	if err != nil || len(c.Intervals) != 1 {
+		t.Fatalf("c=%v err=%v", c, err)
+	}
+}
+
+func TestValidate_WhenNull(t *testing.T) {
+	_, err := Parse([]byte("symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n  - {id: a, interval: 5m, when: null, channels: [tg]}"))
+	if err == nil || !strings.Contains(err.Error(), "missing when") {
+		t.Fatalf("err=%v", err)
+	}
+}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -98,11 +99,8 @@ func Parse(data []byte) (*Config, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	c, err := raw.build()
-	if err != nil {
-		return nil, err
-	}
-	if err := c.Validate(); err != nil {
+	c, buildErr := raw.build()
+	if err := errors.Join(buildErr, c.Validate()); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -153,7 +151,7 @@ func (r *rawConfig) build() (*Config, error) {
 		if rr.Cooldown != "" {
 			d, err := time.ParseDuration(rr.Cooldown)
 			if err != nil {
-				errs = append(errs, fmt.Errorf("rules[%d] %q: invalid cooldown %q", i, rr.ID, rr.Cooldown))
+				errs = append(errs, fmt.Errorf("rules[%d] %q: invalid cooldown %q: %w", i, rr.ID, rr.Cooldown, err))
 			}
 			rule.Cooldown = d
 		}
@@ -161,9 +159,15 @@ func (r *rawConfig) build() (*Config, error) {
 	}
 
 	if len(r.Intervals) > 0 {
+		seen := map[market.Interval]bool{}
 		for _, s := range r.Intervals {
-			c.Intervals = append(c.Intervals, market.Interval(s))
+			i := market.Interval(s)
+			if !seen[i] {
+				seen[i] = true
+				c.Intervals = append(c.Intervals, i)
+			}
 		}
+		c.explicitIntervals = true
 	} else {
 		seen := map[market.Interval]bool{}
 		for _, rule := range c.Rules {
@@ -182,7 +186,7 @@ func (r *rawConfig) build() (*Config, error) {
 	if r.Notify.MergeWindow != "" {
 		d, err := time.ParseDuration(r.Notify.MergeWindow)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("notify.merge_window: invalid duration %q", r.Notify.MergeWindow))
+			errs = append(errs, fmt.Errorf("notify.merge_window: invalid duration %q: %w", r.Notify.MergeWindow, err))
 		} else {
 			c.Notify.MergeWindow = d
 		}
@@ -197,10 +201,7 @@ func (r *rawConfig) build() (*Config, error) {
 		c.Notify.QuietHours = &QuietHours{Start: q.Start, End: q.End, TZ: q.TZ}
 	}
 
-	if len(errs) > 0 {
-		return nil, joinErrors(errs)
-	}
-	return c, nil
+	return c, errors.Join(errs...)
 }
 
 // RulesFor returns the rules that apply to symbol.
