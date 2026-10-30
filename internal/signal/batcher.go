@@ -3,8 +3,6 @@ package signal
 import (
 	"context"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"trader-bot/internal/clock"
@@ -143,7 +141,7 @@ func (b *Batcher) add(s Signal) {
 	}
 	chans := dedupe(s.Channels)
 	if len(chans) == 0 {
-		b.record(s) // nowhere to deliver; still persisted
+		b.record(s) // Suppressed="": unreachable in practice, config.Validate forbids rules without channels
 		return
 	}
 	e := &entry{sig: s, remaining: len(chans)}
@@ -279,17 +277,14 @@ func (b *Batcher) inQuiet(cfg config.NotifyConfig) bool {
 	return m >= start || m < end // wraps midnight
 }
 
+// parseHHMM uses the same parser as config.Validate so both accept the same
+// inputs (e.g. "7:00").
 func parseHHMM(s string) (int, bool) {
-	h, m, ok := strings.Cut(s, ":")
-	if !ok || len(h) != 2 || len(m) != 2 {
+	t, err := time.Parse("15:04", s)
+	if err != nil {
 		return 0, false
 	}
-	hh, err1 := strconv.Atoi(h)
-	mm, err2 := strconv.Atoi(m)
-	if err1 != nil || err2 != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 {
-		return 0, false
-	}
-	return hh*60 + mm, true
+	return t.Hour()*60 + t.Minute(), true
 }
 
 func dedupe(chans []string) []string {

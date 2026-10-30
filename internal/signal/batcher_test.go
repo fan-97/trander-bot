@@ -351,6 +351,14 @@ func TestBatcher_QuietHours(t *testing.T) {
 		{"daytime", time.Date(2026, 10, 31, 12, 0, 0, 0, sh), nil, false},
 		// 23:30 UTC is 07:30 Shanghai: TZ must be honored.
 		{"tz honored", time.Date(2026, 10, 30, 23, 30, 0, 0, time.UTC), nil, false},
+		{"single-digit hour end", time.Date(2026, 10, 31, 6, 30, 0, 0, sh), func(c config.NotifyConfig) config.NotifyConfig {
+			c.QuietHours = &config.QuietHours{Start: "23:00", End: "7:00", TZ: "Asia/Shanghai"}
+			return c
+		}, true},
+		{"single-digit hour end exclusive", time.Date(2026, 10, 31, 7, 0, 0, 0, sh), func(c config.NotifyConfig) config.NotifyConfig {
+			c.QuietHours = &config.QuietHours{Start: "23:00", End: "7:00", TZ: "Asia/Shanghai"}
+			return c
+		}, false},
 		{"non-wrapping", time.Date(2026, 10, 31, 13, 0, 0, 0, sh), func(c config.NotifyConfig) config.NotifyConfig {
 			c.QuietHours = &config.QuietHours{Start: "12:00", End: "14:00", TZ: "Asia/Shanghai"}
 			return c
@@ -470,4 +478,26 @@ func TestBatcher_CancelReturnsNil(t *testing.T) {
 		t.Fatalf("record = %s", r.RuleID)
 	}
 	h.noRecord()
+}
+
+func TestBatcher_HotReloadReArmsEarlierTimer(t *testing.T) {
+	h := newHarness(t, noonUTC, baseCfg())   // MergeWindow 10s
+	h.send(sig("a", config.LevelWarn, "tg")) // tg closes at t=10s
+	nc := baseCfg()
+	nc.MergeWindow = 2 * time.Second
+	h.setCfg(nc)
+	h.clk.Advance(time.Second)
+	h.send(sig("b", config.LevelWarn, "mail")) // mail closes at t=3s
+	h.clk.Advance(2 * time.Second)             // t=3s
+	if b := h.batch(); b.Channel != "mail" || !eqStrings(ids(b.Signals), []string{"b"}) {
+		t.Fatalf("batch = %s %v, want mail [b]", b.Channel, ids(b.Signals))
+	}
+	if r := h.record(); r.RuleID != "b" {
+		t.Fatalf("record = %s, want b", r.RuleID)
+	}
+	h.noBatch()
+	h.clk.Advance(7 * time.Second) // t=10s
+	if b := h.batch(); b.Channel != "tg" || !eqStrings(ids(b.Signals), []string{"a"}) {
+		t.Fatalf("batch = %s %v, want tg [a]", b.Channel, ids(b.Signals))
+	}
 }
