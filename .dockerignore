@@ -1,0 +1,7 @@
+.git
+.superpowers
+.agents
+.claude
+bin
+deploy/.env
+configs/config.yaml

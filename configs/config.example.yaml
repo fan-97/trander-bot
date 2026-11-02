@@ -1,0 +1,53 @@
+symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+# intervals: [5m, 1h]   # optional; defaults to the intervals used by rules
+
+rules:
+  - id: pump_with_volume
+    symbols: all            # or an explicit list
+    interval: 5m
+    trigger: on_close       # on_close (default, candle-close confirmed) | realtime
+    when:
+      all:
+        - change_pct(1) > 3
+        - volume_ratio(20) > 2
+    cooldown: 30m
+    channels: [telegram, discord]
+    level: warn
+  - id: rsi_oversold_funding_negative
+    interval: 1h
+    when:
+      all:
+        - rsi(14) < 30
+        - any:
+            - funding_rate < -0.0005
+            - oi_change_pct(4) > 10
+    cooldown: 1h
+    channels: [telegram]
+
+channels:
+  telegram:
+    type: telegram
+    fallback: discord
+    params:
+      token: ${TELEGRAM_TOKEN}
+      chat_id: ${TELEGRAM_CHAT_ID}
+  discord:
+    type: discord
+    params:
+      url: ${DISCORD_WEBHOOK_URL}
+
+notify:
+  merge_window: 10s
+  rate_per_minute: 20
+  quiet_min_level: critical   # during quiet hours only this level and above is pushed
+  # quiet_hours:
+  #   start: "23:00"
+  #   end: "07:00"
+  #   tz: Asia/Shanghai
+
+database:
+  dsn: ${DATABASE_URL}
+
+binance:
+  rest_url: https://fapi.binance.com
+  ws_url: wss://fstream.binance.com/market
