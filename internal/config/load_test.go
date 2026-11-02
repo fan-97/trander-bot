@@ -160,9 +160,14 @@ func TestValidate_RealtimeOperands(t *testing.T) {
 	if _, err := Parse([]byte(head + `  - {id: a, interval: 5m, when: {all: ["rsi(14) < 30"]}, channels: [tg]}`)); err != nil {
 		t.Fatalf("on_close: %v", err)
 	}
-	ok := `  - {id: a, interval: 5m, trigger: realtime, when: {any: ["close > 100", "change_pct(3) > 2", "volume > 1000", "funding_rate < -0.0005", "oi_change_pct(4) > 10", "liq_volume(5) > 1000000"]}, channels: [tg]}`
+	ok := `  - {id: a, interval: 5m, trigger: realtime, when: {any: ["close > 100", "change_pct(3) > 2", "volume > 1000", "funding_rate < -0.0005", "oi_change_pct(4) > 10", "liq_volume(5) > 1000000", "amplitude_pct > 3", "volume_ratio(20) > 1.5", "high > 1", "low < 1", "open > 1"]}, channels: [tg]}`
 	if _, err := Parse([]byte(head + ok)); err != nil {
 		t.Fatalf("allowed operands rejected: %v", err)
+	}
+	// wick shape is only known once the bar closes
+	_, err = Parse([]byte(head + `  - {id: a, interval: 5m, trigger: realtime, when: {all: ["lower_wick_atr(14) > 2"]}, channels: [tg]}`))
+	if err == nil || !strings.Contains(err.Error(), "lower_wick_atr(14)") {
+		t.Fatalf("wick in realtime accepted: %v", err)
 	}
 }
 

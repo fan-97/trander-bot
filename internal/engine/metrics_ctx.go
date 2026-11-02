@@ -4,6 +4,7 @@ import (
 	"math"
 	"time"
 
+	"trader-bot/internal/indicator"
 	"trader-bot/internal/market"
 	"trader-bot/internal/rule"
 )
@@ -193,7 +194,7 @@ func (c *contract) get(o rule.Operand, now time.Time, started bool) (cur, prev f
 
 // values implements rule.Values for one rule interval. With live == nil it
 // reads closed-bar indicators; with live set it is the provisional view used
-// by realtime rules (close, volume and change_pct read the live bar).
+// by realtime rules (see provisional for the operands that read the live bar).
 // Contract operands are symbol-level either way. now is fixed at
 // construction so Get is pure across Eval and Describe.
 type values struct {
@@ -265,6 +266,62 @@ func (v values) provisional(o rule.Operand) (cur, prev float64, ok, handled bool
 			}
 		}
 		return cur, prev, true, true
+	case "open", "high", "low":
+		pick := func(k market.Kline) float64 {
+			switch o.Func {
+			case "open":
+				return k.Open
+			case "high":
+				return k.High
+			}
+			return k.Low
+		}
+		if n > 0 {
+			prev = pick(bars[n-1])
+		}
+		return pick(*v.live), prev, true, true
+	case "amplitude_pct":
+		if n < 1 {
+			return 0, 0, false, true
+		}
+		cur, ok = indicator.AmplitudePct(*v.live, bars[n-1].Close)
+		if !ok {
+			return 0, 0, false, true
+		}
+		if n >= 2 {
+			if p, pok := indicator.AmplitudePct(bars[n-1], bars[n-2].Close); pok {
+				prev = p
+			}
+		}
+		return cur, prev, true, true
+	case "volume_ratio":
+		// The live bar's volume so far against the mean of the previous k
+		// closed bars: early in a bar it understates, so it errs on quiet.
+		k, valid := posInt(o.Args)
+		if !valid || n < k {
+			return 0, 0, false, true
+		}
+		cur, ok = volRatio(v.live.Volume, bars[n-k:])
+		if !ok {
+			return 0, 0, false, true
+		}
+		if n >= k+1 {
+			if p, pok := volRatio(bars[n-1].Volume, bars[n-1-k:n-1]); pok {
+				prev = p
+			}
+		}
+		return cur, prev, true, true
 	}
 	return 0, 0, false, false
+}
+
+func volRatio(vol float64, base []market.Kline) (float64, bool) {
+	var sum float64
+	for _, b := range base {
+		sum += b.Volume
+	}
+	if sum == 0 {
+		return 0, false
+	}
+	return vol / (sum / float64(len(base))), true
 }
