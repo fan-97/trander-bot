@@ -259,9 +259,11 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 				Lines: []string{"配置文件热加载失败，继续使用旧配置", err.Error()}})
 		})
 	})
+	// Subscribe before starting the loop so a reload published in between is not missed.
+	rawSub := raw.Subscribe()
 	g.Go(func() error {
 		refresh := func(ctx context.Context) (map[string]bool, error) { return exchangeSymbols(ctx, rest) }
-		reloadLoop(gctx, raw, store, refresh, have, mon, changed, log)
+		reloadLoop(gctx, rawSub, store, refresh, have, mon, changed, log)
 		return nil
 	})
 	g.Go(func() error { return ignoreCancel(stream.Run(gctx, symbols, changed, events)) })
@@ -395,9 +397,8 @@ func droppedMessage(dropped []string) notify.Message {
 // updates the health monitor when the pool changed. Notification channels,
 // the database DSN and the Binance URLs are fixed at startup: a change to
 // them is logged and takes effect only after a restart.
-func reloadLoop(ctx context.Context, raw, store *config.Store, refresh func(context.Context) (map[string]bool, error), have map[string]bool,
+func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.Store, refresh func(context.Context) (map[string]bool, error), have map[string]bool,
 	mon *health.Monitor, changed chan<- struct{}, log *slog.Logger) {
-	sub := raw.Subscribe()
 	for {
 		var c *config.Config
 		select {

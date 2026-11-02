@@ -69,9 +69,10 @@ func startReload(t *testing.T, initial *config.Config) *reloadHarness {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	refresh := func(context.Context) (map[string]bool, error) { return have, nil }
+	sub := h.raw.Subscribe()
 	go func() {
 		defer close(done)
-		reloadLoop(ctx, h.raw, h.store, refresh, have, h.mon, h.changed, slog.Default())
+		reloadLoop(ctx, sub, h.store, refresh, have, h.mon, h.changed, slog.Default())
 	}()
 	t.Cleanup(func() { cancel(); <-done })
 	return h

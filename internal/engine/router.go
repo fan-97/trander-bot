@@ -25,6 +25,7 @@ type HistoryFunc func(ctx context.Context, symbol string) (map[market.Interval][
 // a worker's channel is full.
 type Router struct {
 	store   *config.Store
+	sub     <-chan *config.Config // subscribed at construction so no update before Run is missed
 	gate    *signal.Gate
 	out     chan<- signal.Signal
 	clk     clock.Clock
@@ -49,7 +50,7 @@ type workerHandle struct {
 // NewRouter creates a router. history may be nil (workers start cold).
 func NewRouter(store *config.Store, gate *signal.Gate, out chan<- signal.Signal, clk clock.Clock,
 	history func(ctx context.Context, symbol string) (map[market.Interval][]market.Kline, error)) *Router {
-	return &Router{store: store, gate: gate, out: out, clk: clk, history: history, workers: map[string]*workerHandle{}}
+	return &Router{store: store, sub: store.Subscribe(), gate: gate, out: out, clk: clk, history: history, workers: map[string]*workerHandle{}}
 }
 
 func (r *Router) log() *slog.Logger {
@@ -66,7 +67,7 @@ func (r *Router) Backpressure() int64 { return r.backpressure.Load() }
 // Run routes in until ctx is cancelled or in is closed, then stops every
 // worker and returns nil.
 func (r *Router) Run(ctx context.Context, in <-chan market.Event) error {
-	sub := r.store.Subscribe()
+	sub := r.sub
 	defer r.stopAll()
 	r.reconcile(ctx, r.store.Current())
 	for {
