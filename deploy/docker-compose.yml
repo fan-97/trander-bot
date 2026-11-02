@@ -9,10 +9,19 @@
 
 name: traderbot
 
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg16
+    # Pinned: the schema's TimescaleDB DDL was written for 2.x. Bump the tag
+    # deliberately and re-run the storage integration tests (README).
+    image: timescale/timescaledb:2.17.2-pg16
     restart: unless-stopped
+    logging: *logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-traderbot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
@@ -20,7 +29,9 @@ services:
     volumes:
       - tsdb-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      # -h 127.0.0.1: over TCP, so the entrypoint's socket-only init server
+      # (first boot) does not count as ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -32,6 +43,7 @@ services:
       dockerfile: deploy/Dockerfile
     image: traderbot:latest
     restart: unless-stopped
+    logging: *logging
     depends_on:
       timescaledb:
         condition: service_healthy

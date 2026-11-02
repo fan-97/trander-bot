@@ -230,8 +230,11 @@ curl -i localhost:8080/healthz
 docker compose -f deploy/docker-compose.yml logs -f traderbot
 ```
 
-- 两个服务：`timescaledb`（`timescale/timescaledb:latest-pg16`，数据在 `tsdb-data` 卷里，`pg_isready` 健康检查）
+- 两个服务：`timescaledb`（固定为 `timescale/timescaledb:2.17.2-pg16`，数据在 `tsdb-data` 卷里，`pg_isready -h 127.0.0.1` 健康检查）
   和 `traderbot`（等数据库健康后再启动，`restart: unless-stopped`）。
+  升级 TimescaleDB 时请改 `deploy/docker-compose.yml` 里的镜像标签，并先用新标签跑一遍下面的集成测试。
+- 两个服务的日志都做了轮转（单文件 10MB，保留 3 个）。
+- 注意：Docker 的健康检查只会把容器标成 unhealthy，**不会自动重启**；需要自动重启请另配 autoheal 之类的工具。
 - `deploy/.env` 既用于 compose 变量替换（数据库账号），也作为 `traderbot` 容器的环境变量（配置里的 `${VAR}`）。
   `DATABASE_URL` 由 compose 根据 `POSTGRES_*` 自动拼好。
 - 挂载的是整个 `configs/` **目录**（只读），而不是单个文件：编辑器保存时通常是“写新文件再改名”，
@@ -247,7 +250,7 @@ docker compose -f deploy/docker-compose.yml logs -f traderbot
 上生产前请执行一次存储层的集成测试（见 `internal/storage/README.md`）：
 
 ```sh
-docker run -d --name tb-tsdb -p 5433:5432 -e POSTGRES_PASSWORD=pg timescale/timescaledb:latest-pg16
+docker run -d --name tb-tsdb -p 5433:5432 -e POSTGRES_PASSWORD=pg timescale/timescaledb:2.17.2-pg16
 TEST_DATABASE_URL='postgres://postgres:pg@localhost:5433/postgres?sslmode=disable' \
   go test -race -count=1 -tags integration ./internal/storage/...
 docker rm -f tb-tsdb

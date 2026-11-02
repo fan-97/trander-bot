@@ -80,6 +80,39 @@ func TestWatcher_ReloadsOnChange(t *testing.T) {
 	}
 }
 
+// Deleting the file (the first half of a delete+create save) must not try to
+// load a missing file and raise a false error; the later create reloads.
+func TestWatcher_RemoveIsIgnored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeAtomic(t, path, "symbols: [BTCUSDT]\n"+cfgTmpl[len("symbols: [%s]\n"):])
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewStore(c)
+	ch := s.Subscribe()
+	errCh := make(chan error, 4)
+	startWatch(t, path, s, func(err error) { errCh <- err })
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("remove raised onErr: %v", err)
+	case <-time.After(800 * time.Millisecond):
+	}
+	writeAtomic(t, path, "symbols: [BTCUSDT, ETHUSDT]\n"+cfgTmpl[len("symbols: [%s]\n"):])
+	select {
+	case got := <-ch:
+		if len(got.Symbols) != 2 {
+			t.Fatalf("symbols=%v", got.Symbols)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reload after the file was recreated")
+	}
+}
+
 func TestWatcher_InvalidKeepsOld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	writeAtomic(t, path, "symbols: [BTCUSDT]\n"+cfgTmpl[len("symbols: [%s]\n"):])

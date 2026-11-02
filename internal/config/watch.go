@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,10 @@ func (s *Store) Set(c *Config) {
 // Watch reloads path on change (debounced) and publishes valid configs to s.
 // Invalid configs are reported via onErr (may be nil) and the old snapshot is kept.
 // It returns nil when ctx is cancelled, or an error if the watcher cannot start.
+// errWatcherClosed is returned when fsnotify stops delivering events, so the
+// loss of hot reload surfaces (errgroup) instead of passing silently.
+var errWatcherClosed = errors.New("config watcher: fsnotify channels closed, hot reload stopped")
+
 func Watch(ctx context.Context, path string, s *Store, onErr func(error)) error {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -98,9 +103,12 @@ func Watch(ctx context.Context, path string, s *Store, onErr func(error)) error 
 			return nil
 		case ev, ok := <-w.Events:
 			if !ok {
-				return nil
+				return errWatcherClosed
 			}
-			if filepath.Base(ev.Name) != base {
+			// Only a write or a (re)created file means new content. Remove and
+			// Rename are the first half of an editor's save; reacting to them
+			// would load a missing file and raise a false 配置无效.
+			if filepath.Base(ev.Name) != base || ev.Op&(fsnotify.Write|fsnotify.Create) == 0 {
 				continue
 			}
 			if timer == nil {
@@ -110,7 +118,7 @@ func Watch(ctx context.Context, path string, s *Store, onErr func(error)) error 
 			}
 		case err, ok := <-w.Errors:
 			if !ok {
-				return nil
+				return errWatcherClosed
 			}
 			if onErr != nil {
 				onErr(err)

@@ -16,7 +16,7 @@ The Timescale statements (extension, hypertables, compression policy) have
 only been checked by an actual TimescaleDB run if you do this:
 
 ```sh
-docker run -d --name tb-tsdb -p 5433:5432 -e POSTGRES_PASSWORD=pg timescale/timescaledb:latest-pg16
+docker run -d --name tb-tsdb -p 5433:5432 -e POSTGRES_PASSWORD=pg timescale/timescaledb:2.17.2-pg16
 TEST_DATABASE_URL='postgres://postgres:pg@localhost:5433/postgres?sslmode=disable' \
   go test -race -count=1 -tags integration ./internal/storage/...
 docker rm -f tb-tsdb
