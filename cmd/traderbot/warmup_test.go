@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -211,5 +212,43 @@ func TestWarmup_ShutdownDoesNotAlert(t *testing.T) {
 	}
 	if a := alerts.titles(); len(a) != 0 {
 		t.Errorf("alerts on shutdown: %v", a)
+	}
+}
+
+type lastTimeSink struct {
+	Store
+	last map[market.Interval]time.Time
+	err  error
+}
+
+func (s lastTimeSink) LastKlineTime(_ context.Context, _ string, iv market.Interval) (time.Time, bool, error) {
+	t, ok := s.last[iv]
+	return t, ok, s.err
+}
+
+// A restart re-fetches hundreds of bars per interval; only those newer than
+// the database's latest are written, so warmup does not flood the writer or
+// rewrite (compressed) history.
+func TestUnstored(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	ks := make([]market.Kline, 5)
+	for i := range ks {
+		ks[i] = market.Kline{Symbol: "BTCUSDT", Interval: market.I1h, OpenTime: base.Add(time.Duration(i) * time.Hour), Closed: true}
+	}
+	ctx := context.Background()
+	log := slog.New(slog.DiscardHandler)
+
+	got := unstored(ctx, lastTimeSink{last: map[market.Interval]time.Time{market.I1h: base.Add(2 * time.Hour)}}, ks, log)
+	if len(got) != 2 || !got[0].OpenTime.Equal(base.Add(3*time.Hour)) {
+		t.Fatalf("got %d bars from %v, want 2 from +3h", len(got), got)
+	}
+	if got := unstored(ctx, lastTimeSink{last: map[market.Interval]time.Time{}}, ks, log); len(got) != 5 {
+		t.Fatalf("empty table: got %d, want all 5", len(got))
+	}
+	if got := unstored(ctx, lastTimeSink{err: errors.New("db down")}, ks, log); len(got) != 5 {
+		t.Fatalf("lookup error: got %d, want all 5 (old behaviour)", len(got))
+	}
+	if got := unstored(ctx, &memSink{}, ks, log); len(got) != 5 {
+		t.Fatalf("store without lookup: got %d, want all 5", len(got))
 	}
 }

@@ -280,7 +280,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 
 	stream := binance.NewStream(cfg.Binance.WSURL, rest, clk, mon.OnConn)
 	persistWarmup := func(ks []market.Kline) {
-		for _, k := range ks {
+		for _, k := range unstored(gctx, st, ks, log) {
 			if !k.Closed {
 				continue
 			}
@@ -580,6 +580,38 @@ func warmupPlan(ivs []market.Interval) map[market.Interval]int {
 		plan[market.I1m] = n
 	}
 	return plan
+}
+
+// lastKlineStore is implemented by *storage.Store.
+type lastKlineStore interface {
+	LastKlineTime(ctx context.Context, symbol string, iv market.Interval) (time.Time, bool, error)
+}
+
+// lastKlineTimeout bounds the lookup done before persisting warmup bars.
+const lastKlineTimeout = 5 * time.Second
+
+// unstored returns the bars of ks (one symbol and interval) newer than the
+// newest one already stored. Warmup re-fetches hundreds of bars per interval
+// on every restart; writing them all again floods the writer (dropping data)
+// and rewrites history that TimescaleDB may already have compressed. If st
+// cannot tell, or the lookup fails, every bar is returned.
+func unstored(ctx context.Context, st Store, ks []market.Kline, log *slog.Logger) []market.Kline {
+	ls, ok := st.(lastKlineStore)
+	if !ok || len(ks) == 0 {
+		return ks
+	}
+	lctx, cancel := context.WithTimeout(ctx, lastKlineTimeout)
+	defer cancel()
+	last, found, err := ls.LastKlineTime(lctx, ks[0].Symbol, ks[0].Interval)
+	if err != nil {
+		log.Warn("warmup: latest stored bar unknown, persisting all fetched bars", "symbol", ks[0].Symbol, "interval", ks[0].Interval, "err", err)
+		return ks
+	}
+	if !found {
+		return ks
+	}
+	i := sort.Search(len(ks), func(i int) bool { return ks[i].OpenTime.After(last) })
+	return ks[i:]
 }
 
 // warmup returns the Router's history func: REST bars per warmupPlan, bounded

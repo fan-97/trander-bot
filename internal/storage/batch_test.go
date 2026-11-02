@@ -438,3 +438,23 @@ func TestWriterUnit_FinalFlushLossCountsAsDropped(t *testing.T) {
 		t.Fatalf("Dropped = %d, OnDrop total = %d, want 2", r.w.Dropped(), hook)
 	}
 }
+
+// A burst of overflow is reported as one OnDrop per tick, not one per item.
+func TestWriterUnit_OnDropSummedPerTick(t *testing.T) {
+	fs := &fakeSink{}
+	clk := clock.NewFake(t0)
+	r := start(t, fs, 1_000_000, time.Hour, clk)
+	var mu sync.Mutex
+	var calls []int
+	r.w.OnDrop = func(n int) { mu.Lock(); calls = append(calls, n); mu.Unlock() }
+	for i := 0; i < maxBuffered+7; i++ {
+		r.in <- sig(i)
+	}
+	eventually(t, "drop count", func() bool { return r.w.Dropped() == 7 })
+	r.stop(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != 7 {
+		t.Fatalf("OnDrop calls = %v, want [7]", calls)
+	}
+}
