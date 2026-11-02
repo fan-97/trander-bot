@@ -318,7 +318,7 @@ func (w *Worker) handle(ctx context.Context, ev market.Event) error {
 	// ones wait for their interval's close like every other rule (R22).
 	for i, r := range w.rules {
 		if m := w.meta[i]; m.contractOnly && m.srcs&src != 0 && r.Trigger == config.TriggerRealtime {
-			if err := w.evaluate(ctx, r, w.values(r.Interval, nil), price, false); err != nil {
+			if err := w.evaluate(ctx, r, w.values(r.Interval, nil), price, nil, false, false); err != nil {
 				return err
 			}
 		}
@@ -345,7 +345,7 @@ func (w *Worker) onBar(ctx context.Context, k market.Kline, eval bool) error {
 		stale := w.staleCheck && w.clk.Now().Sub(k.OpenTime.Add(iv.Duration())) > time.Minute
 		for _, r := range w.rules {
 			if r.Interval == iv && r.Trigger == config.TriggerRealtime {
-				if err := w.evaluate(ctx, r, w.values(iv, &live), k.Close, stale); err != nil {
+				if err := w.evaluate(ctx, r, w.values(iv, &live), k.Close, &live, true, stale); err != nil {
 					return err
 				}
 			}
@@ -372,7 +372,7 @@ func (w *Worker) onBar(ctx context.Context, k market.Kline, eval bool) error {
 	stale := w.staleCheck && w.clk.Now().Sub(k.OpenTime.Add(iv.Duration())) > staleLag(iv)
 	for _, r := range w.rules {
 		if r.Interval == iv {
-			if err := w.evaluate(ctx, r, v, k.Close, stale); err != nil {
+			if err := w.evaluate(ctx, r, v, k.Close, &k, false, stale); err != nil {
 				return err
 			}
 		}
@@ -391,7 +391,9 @@ func (w *Worker) retain(k market.Kline) {
 // evaluate runs r through the gate and emits a Signal on a fire or a
 // cooldown-suppressed edge (R2). A fire on a stale bar is emitted with
 // Suppressed="stale": recorded, never delivered.
-func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, price float64, stale bool) error {
+// bar is the evaluated bar of r.Interval (nil for a contract event); live
+// reports that it is still open.
+func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, price float64, bar *market.Kline, live, stale bool) error {
 	if r.When == nil {
 		return nil
 	}
@@ -417,6 +419,12 @@ func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, pri
 		Detail:     detail,
 		Channels:   slices.Clone(r.Channels),
 		Suppressed: suppressed,
+	}
+	if bar != nil {
+		s.BarTime, s.BarLive = bar.OpenTime, live
+		if bar.Open != 0 {
+			s.ChangePct, s.HasChange = (bar.Close/bar.Open-1)*100, true
+		}
 	}
 	select {
 	case w.out <- s:

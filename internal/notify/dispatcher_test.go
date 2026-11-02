@@ -437,6 +437,30 @@ func TestFormat(t *testing.T) {
 	}
 }
 
+func TestFormat_BarTimeAndChange(t *testing.T) {
+	sh, _ := time.LoadLocation("Asia/Shanghai")
+	bar := time.Date(2026, 11, 2, 6, 35, 0, 0, time.UTC) // 14:35 in Shanghai
+	b := signal.Batch{Channel: "tg", Signals: []signal.Signal{
+		{RuleID: "fast", Symbol: "IDOLUSDT", Interval: market.I5m, Level: config.LevelWarn, Price: 0.025466,
+			Detail: "amplitude_pct=3.7 > 3", BarTime: bar, BarLive: true, ChangePct: 2.314, HasChange: true},
+		{RuleID: "dump", Symbol: "BTCUSDT", Interval: market.I1h, Level: config.LevelWarn, Price: 60000,
+			Detail: "x", BarTime: bar, ChangePct: -1.2, HasChange: true},
+	}}
+	got := FormatIn(b, sh).Lines
+	want := []string{
+		"[5m 11-02 14:35 盘中] IDOLUSDT fast @ 0.025466 本根 +2.31% | amplitude_pct=3.7 > 3",
+		"[1h 11-02 14:35 收盘] BTCUSDT dump @ 60000 本根 -1.20% | x",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if l := FormatIn(b, nil).Lines[0]; !strings.HasPrefix(l, "[5m 11-02 06:35 盘中]") {
+		t.Errorf("nil location must be UTC: %q", l)
+	}
+}
+
 func TestDispatcher_CancelDuringBackoffReturnsPromptly(t *testing.T) {
 	a := newFake("a")
 	a.fail = func(int) error { return errors.New("down") }

@@ -19,6 +19,7 @@ import (
 const (
 	defaultMergeWindow   = 10 * time.Second
 	defaultRatePerMinute = 20
+	defaultNotifyTZ      = "Asia/Shanghai" // message times; tzdata is embedded (validate.go)
 	defaultRESTURL       = "https://fapi.binance.com"
 	defaultWSURL         = "wss://fstream.binance.com/market"
 )
@@ -64,6 +65,7 @@ type rawNotify struct {
 		TZ    string `yaml:"tz"`
 	} `yaml:"quiet_hours"`
 	QuietMinLevel string `yaml:"quiet_min_level"`
+	TZ            string `yaml:"tz"`
 }
 
 // stringList accepts either a scalar ("all") or a list of strings.
@@ -228,6 +230,16 @@ func (r *rawConfig) build() (*Config, error) {
 	}
 	if q := r.Notify.QuietHours; q != nil {
 		c.Notify.QuietHours = &QuietHours{Start: q.Start, End: q.End, TZ: q.TZ}
+	}
+	c.Notify.TZ = r.Notify.TZ
+	if c.Notify.TZ == "" {
+		c.Notify.TZ = defaultNotifyTZ
+	}
+	if loc, err := time.LoadLocation(c.Notify.TZ); err != nil {
+		errs = append(errs, fmt.Errorf("notify.tz: unknown time zone %q", c.Notify.TZ))
+		c.Notify.Location = time.UTC
+	} else {
+		c.Notify.Location = loc
 	}
 
 	return c, errors.Join(errs...)
