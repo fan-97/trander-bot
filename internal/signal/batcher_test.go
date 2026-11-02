@@ -533,3 +533,29 @@ func TestBatcher_CollapsesRepeatsInBatch(t *testing.T) {
 		h.record()
 	}
 }
+
+// Collapsed repeats cost one rate-limit token, so they cannot push other
+// rules' signals into rate suppression.
+func TestBatcher_CollapsedRepeatsCostOneToken(t *testing.T) {
+	nc := baseCfg()
+	nc.RatePerMinute = 2
+	h := newHarness(t, noonUTC, nc)
+	for i := 0; i < 3; i++ {
+		s := sig("pump", config.LevelWarn, "tg")
+		s.Symbol = "BTCUSDT"
+		h.send(s)
+	}
+	o := sig("other", config.LevelWarn, "tg")
+	o.Symbol = "ETHUSDT"
+	h.send(o)
+	h.clk.Advance(10 * time.Second)
+	b := h.batch()
+	if !eqStrings(ids(b.Signals), []string{"pump", "other"}) {
+		t.Fatalf("batch = %v, want [pump other]", ids(b.Signals))
+	}
+	for i := 0; i < 4; i++ {
+		if r := h.record(); r.Suppressed != "" {
+			t.Fatalf("record %s suppressed %q", r.RuleID, r.Suppressed)
+		}
+	}
+}

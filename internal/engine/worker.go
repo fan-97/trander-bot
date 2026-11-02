@@ -63,6 +63,7 @@ type Worker struct {
 	// reaching the indicators. histCh carries fetched history back to Run.
 	history  HistoryFunc
 	cold     map[market.Interval]bool
+	tried    map[market.Interval]bool // cold intervals whose history was already fetched
 	histCh   chan histResult
 	fetching bool
 }
@@ -96,6 +97,7 @@ func NewWorker(symbol string, cfg *config.Config, gate *signal.Gate, out chan<- 
 		lastClosed: map[market.Interval]time.Time{},
 		staleCheck: true,
 		cold:       map[market.Interval]bool{},
+		tried:      map[market.Interval]bool{},
 		histCh:     make(chan histResult, 1),
 	}
 	w.setConfig(cfg)
@@ -163,12 +165,21 @@ func (w *Worker) primeGate(ivs []market.Interval) {
 // fetchCold fetches history for the intervals gained on a reload, off the
 // event loop; Run applies the result. At most one fetch is in flight.
 func (w *Worker) fetchCold(ctx context.Context) {
-	if w.history == nil || w.fetching || len(w.cold) == 0 {
+	if w.history == nil || w.fetching {
 		return
 	}
+	// Each gained interval is fetched once: an interval that stays cold after
+	// its fetch drops its first partial bucket instead of re-fetching (a
+	// retry loop would hammer Binance's REST weight limit).
 	ivs := make([]market.Interval, 0, len(w.cold))
 	for iv := range w.cold {
-		ivs = append(ivs, iv)
+		if !w.tried[iv] {
+			ivs = append(ivs, iv)
+			w.tried[iv] = true
+		}
+	}
+	if len(ivs) == 0 {
+		return
 	}
 	slices.SortFunc(ivs, func(a, b market.Interval) int { return cmp.Compare(a.Duration(), b.Duration()) })
 	w.fetching = true
@@ -219,7 +230,10 @@ func (w *Worker) applyHistory(ctx context.Context, h histResult) {
 				_ = w.onBar(ctx, b, false)
 			}
 		}
-		if !filled && iv != market.I1m {
+		// No closed 1m bar in the current bucket: either none has closed yet
+		// (the live feed will build the whole bucket, so it is warm) or the
+		// history lacked them (partial bucket ahead: drop it).
+		if !filled && iv != market.I1m && !w.clk.Now().Before(next.Add(time.Minute)) {
 			w.cold[iv] = true
 		}
 		warmed = append(warmed, iv)
@@ -227,7 +241,7 @@ func (w *Worker) applyHistory(ctx context.Context, h histResult) {
 	if len(warmed) > 0 {
 		w.primeGate(warmed)
 	}
-	w.fetchCold(ctx) // intervals gained while this fetch was in flight
+	w.fetchCold(ctx) // only intervals gained while this fetch was in flight
 }
 
 func sortedClosed(ks []market.Kline) []market.Kline {
@@ -326,9 +340,12 @@ func (w *Worker) onBar(ctx context.Context, k market.Kline, eval bool) error {
 			return nil
 		}
 		live := k
+		// A live in-progress bucket ends in the future; one built from gap-
+		// filled 1m bars after an outage ended a while ago: replayed data.
+		stale := w.staleCheck && w.clk.Now().Sub(k.OpenTime.Add(iv.Duration())) > time.Minute
 		for _, r := range w.rules {
 			if r.Interval == iv && r.Trigger == config.TriggerRealtime {
-				if err := w.evaluate(ctx, r, w.values(iv, &live), k.Close, false); err != nil {
+				if err := w.evaluate(ctx, r, w.values(iv, &live), k.Close, stale); err != nil {
 					return err
 				}
 			}
@@ -493,6 +510,7 @@ func (w *Worker) setConfig(cfg *config.Config) {
 			w.aggs[iv] = market.NewAggregator(w.symbol, []market.Interval{iv})
 			if w.started {
 				w.cold[iv] = true // gained on a reload: no history yet (I3)
+				delete(w.tried, iv)
 			}
 		}
 	}

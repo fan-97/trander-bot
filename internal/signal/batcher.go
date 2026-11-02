@@ -203,8 +203,18 @@ func (b *Batcher) decide(w *window) Batch {
 	rate := b.cfg().RatePerMinute
 	now := b.clk.Now()
 	batch := Batch{Channel: w.channel}
+	// Repeats of one (rule, symbol) collapse into one line below, so they
+	// share the first occurrence's rate-limit decision (one token).
+	type key struct{ rule, symbol string }
+	allowed := map[key]bool{}
 	for _, e := range w.entries {
-		if e.sig.Level == config.LevelCritical || b.take(w.channel, rate, now) {
+		k := key{e.sig.RuleID, e.sig.Symbol}
+		ok, seen := allowed[k]
+		if !seen {
+			ok = e.sig.Level == config.LevelCritical || b.take(w.channel, rate, now)
+			allowed[k] = ok
+		}
+		if ok {
 			e.delivered = true
 			batch.Signals = append(batch.Signals, e.sig)
 		}

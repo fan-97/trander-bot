@@ -214,6 +214,73 @@ func TestWorker_ReloadedIntervalWarmsFromHistory(t *testing.T) {
 	}
 }
 
+// N1: an interval that stays cold after its history fetch (no closed bar of
+// it yet, e.g. a new listing or a timed-out warmup) must not be re-fetched in
+// a loop; and a reload right at a bucket start is warm, not cold.
+func TestWorker_ReloadedIntervalFetchedOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hist     func(now time.Time) map[market.Interval][]market.Kline
+		wantCold bool
+	}{
+		{"no history for the interval", func(time.Time) map[market.Interval][]market.Kline { return nil }, true},
+		{"reload at the start of a bucket", func(now time.Time) map[market.Interval][]market.Kline {
+			// Closed 15m bars up to the bucket that just ended; no 1m bar of
+			// the new bucket has closed yet.
+			var q []market.Kline
+			end := now.Truncate(15 * time.Minute)
+			for i := 20; i >= 1; i-- {
+				q = append(q, market.Kline{Symbol: sym, Interval: market.I15m, OpenTime: end.Add(-time.Duration(i) * 15 * time.Minute),
+					Open: 100, High: 100, Low: 100, Close: 100, Volume: 15, Closed: true})
+			}
+			return map[market.Interval][]market.Kline{market.I15m: q}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, parseCfg(t, `{id: a, interval: 5m, when: {all: ["close > 1"]}, channels: [tg]}`))
+			h.clk.Advance(h.clk.Now().Truncate(15*time.Minute).Add(15*time.Minute).Sub(h.clk.Now()) + 20*time.Second)
+			h.w.started = true
+			var calls int
+			h.w.history = func(context.Context, string) (map[market.Interval][]market.Kline, error) {
+				calls++
+				return tc.hist(h.clk.Now()), nil
+			}
+			h.w.reconfigure(parseCfg(t,
+				`{id: a, interval: 5m, when: {all: ["close > 1"]}, channels: [tg]}`,
+				`{id: b, interval: 15m, when: {all: ["close > 1"]}, channels: [tg]}`))
+			h.w.fetchCold(context.Background())
+			h.w.applyHistory(context.Background(), <-h.w.histCh)
+			if h.w.fetching {
+				t.Fatal("applyHistory started another fetch for an interval it already fetched")
+			}
+			select {
+			case <-h.w.histCh:
+				t.Fatal("a second history result arrived")
+			case <-time.After(50 * time.Millisecond):
+			}
+			if calls != 1 {
+				t.Fatalf("history called %d times, want 1", calls)
+			}
+			if got := h.w.cold[market.I15m]; got != tc.wantCold {
+				t.Fatalf("cold = %v, want %v", got, tc.wantCold)
+			}
+		})
+	}
+}
+
+// N2: a realtime rule evaluated on an in-progress bucket rebuilt from
+// gap-filled (old) 1m bars is recorded as stale, not delivered.
+func TestWorker_RealtimeOnReplayedBucketIsStale(t *testing.T) {
+	cfg := `{id: rt, interval: 5m, trigger: realtime, cooldown: 0s, when: {all: ["close > 100"]}, channels: [tg]}`
+	h := newHarness(t, parseCfg(t, cfg))
+	h.w.staleCheck = true
+	// Minute 0's bucket ended ~24h before the harness clock.
+	got := h.handle(t, k1(sym, 0, 105, 1, true))
+	if len(got) != 1 || got[0].Suppressed != "stale" {
+		t.Fatalf("replayed bucket: want one stale signal, got %+v", got)
+	}
+}
+
 // I2: a closed bar that arrives long after it closed (a gap fill after an
 // outage) still updates indicators, but its signal is recorded as stale and
 // never delivered; the same bar arriving on time fires normally.
