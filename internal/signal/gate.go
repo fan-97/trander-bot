@@ -21,6 +21,15 @@ type Signal struct {
 	Detail         string
 	Channels       []string
 	Suppressed     string
+
+	// BarTime is the open time of the evaluated bar of Interval; zero when the
+	// signal came from a contract event rather than a bar. BarLive reports
+	// that the bar was still open (realtime rule).
+	BarTime time.Time
+	BarLive bool
+	// ChangePct is the bar's change from its open, in %; valid if HasChange.
+	ChangePct float64
+	HasChange bool
 }
 
 type key struct{ rule, symbol string }

@@ -73,6 +73,10 @@ type NotifyConfig struct {
 	RatePerMinute int
 	QuietHours    *QuietHours
 	QuietMinLevel Level
+	// TZ names the time zone message times are shown in; Location is it
+	// loaded (never nil after Parse).
+	TZ       string
+	Location *time.Location
 }
 
 type QuietHours struct {

@@ -210,3 +210,21 @@ func TestBuild_DefaultCooldown(t *testing.T) {
 		}
 	}
 }
+
+func TestNotifyTZ(t *testing.T) {
+	head := "symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules: [{id: a, interval: 5m, when: \"close > 1\", channels: [tg]}]\n"
+	c, err := Parse([]byte(head))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Notify.Location == nil || c.Notify.Location.String() != "Asia/Shanghai" {
+		t.Fatalf("default location = %v", c.Notify.Location)
+	}
+	c, err = Parse([]byte(head + "notify: {tz: UTC}\n"))
+	if err != nil || c.Notify.Location.String() != "UTC" {
+		t.Fatalf("tz UTC: %v %v", c.Notify.Location, err)
+	}
+	if _, err := Parse([]byte(head + "notify: {tz: Mars/Base}\n")); err == nil || !strings.Contains(err.Error(), "notify.tz") {
+		t.Fatalf("bad tz: %v", err)
+	}
+}

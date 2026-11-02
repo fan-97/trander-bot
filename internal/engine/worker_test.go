@@ -697,3 +697,37 @@ func TestWorker_WarmupSeedsInProgressBucket(t *testing.T) {
 		t.Fatalf("bucket not complete: %+v", got)
 	}
 }
+
+func k1o(min int, open, close float64, closed bool) market.KlineEvent {
+	e := k1(sym, min, close, 1, closed)
+	e.Open = open
+	return e
+}
+
+// Signals carry the evaluated bar's open time, whether it was still open,
+// and its change from open, so a message can say which bar and which way.
+func TestWorker_SignalCarriesBar(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: up, interval: 5m, when: {all: ["close > 103"]}, channels: [tg]}`))
+	h.w.Warmup(hist5(30, flat))
+	got := h.run(t, k1o(150, 100, 101, true), k1o(151, 101, 104, true), k1o(152, 104, 104, true),
+		k1o(153, 104, 104, true), k1o(154, 104, 104, true))
+	if len(got) != 1 {
+		t.Fatalf("signals=%v", ids(got))
+	}
+	s := got[0]
+	if !s.BarTime.Equal(t0.Add(150*time.Minute)) || s.BarLive || !s.HasChange || abs(s.ChangePct-4) > 1e-9 {
+		t.Fatalf("bar time=%v live=%v change=%v/%v", s.BarTime, s.BarLive, s.ChangePct, s.HasChange)
+	}
+
+	rt := newHarness(t, parseCfg(t, `{id: rt, interval: 5m, trigger: realtime, when: {all: ["close < 98"]}, channels: [tg]}`))
+	rt.w.Warmup(hist5(30, flat))
+	rt.handle(t, k1o(150, 100, 99, true))
+	got = rt.handle(t, k1o(151, 99, 97, false))
+	if len(got) != 1 {
+		t.Fatalf("realtime signals=%v", ids(got))
+	}
+	s = got[0]
+	if !s.BarTime.Equal(t0.Add(150*time.Minute)) || !s.BarLive || abs(s.ChangePct-(-3)) > 1e-9 {
+		t.Fatalf("realtime bar time=%v live=%v change=%v", s.BarTime, s.BarLive, s.ChangePct)
+	}
+}

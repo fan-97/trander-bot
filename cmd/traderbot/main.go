@@ -249,6 +249,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 
 	raw := config.NewStore(cfg)      // what is on disk; config.Watch publishes here
 	store := config.NewStore(active) // what the bot runs on: symbols validated
+	disp.Location = func() *time.Location { return store.Current().Notify.Location }
 
 	g, gctx := errgroup.WithContext(ctx)
 	// A signal-driven shutdown is bounded in main; a component failure

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"trader-bot/internal/config"
 	"trader-bot/internal/signal"
@@ -66,7 +67,15 @@ func tradingViewURL(sym string) string {
 // and the signal count, and Binance/TradingView links for each distinct symbol
 // in first-seen order. An empty batch (which the Batcher never emits) yields
 // "[INFO] 0 signal(s)" with level info.
-func Format(b signal.Batch) Message {
+func Format(b signal.Batch) Message { return FormatIn(b, nil) }
+
+// FormatIn is Format showing bar times in loc (nil means UTC). A signal with
+// a bar is rendered as "[5m 11-02 14:35 盘中] SYM rule @ price 本根 +2.31% | detail";
+// 盘中 marks a bar still open, 收盘 a closed one.
+func FormatIn(b signal.Batch, loc *time.Location) Message {
+	if loc == nil {
+		loc = time.UTC
+	}
 	m := Message{Level: config.LevelInfo, Lines: make([]string, 0, len(b.Signals))}
 	seen := make(map[string]bool)
 	for i, s := range b.Signals {
@@ -77,8 +86,20 @@ func Format(b signal.Batch) Message {
 		if detail == "" {
 			detail = s.RuleID
 		}
-		m.Lines = append(m.Lines, fmt.Sprintf("[%s] %s %s @ %s | %s",
-			s.Interval, s.Symbol, s.RuleID, strconv.FormatFloat(s.Price, 'f', -1, 64), detail))
+		head := string(s.Interval)
+		if !s.BarTime.IsZero() {
+			state := "收盘"
+			if s.BarLive {
+				state = "盘中"
+			}
+			head += " " + s.BarTime.In(loc).Format("01-02 15:04") + " " + state
+		}
+		change := ""
+		if s.HasChange {
+			change = fmt.Sprintf(" 本根 %+.2f%%", s.ChangePct)
+		}
+		m.Lines = append(m.Lines, fmt.Sprintf("[%s] %s %s @ %s%s | %s",
+			head, s.Symbol, s.RuleID, strconv.FormatFloat(s.Price, 'f', -1, 64), change, detail))
 		if !seen[s.Symbol] {
 			seen[s.Symbol] = true
 			m.Links = append(m.Links,

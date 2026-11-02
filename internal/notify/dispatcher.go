@@ -72,6 +72,9 @@ type Dispatcher struct {
 	// Logger receives delivery errors and drops. Set it before Run;
 	// nil means slog.Default().
 	Logger *slog.Logger
+	// Location, if set, returns the time zone signal bar times are shown in
+	// (read per batch, so it follows config reloads). nil means UTC.
+	Location func() *time.Location
 
 	ns       map[string]Notifier
 	fallback map[string]string
@@ -306,7 +309,11 @@ func (d *Dispatcher) Run(ctx context.Context, in <-chan signal.Batch) error {
 				// The Batcher never emits an empty batch; ignore one defensively.
 				continue
 			}
-			d.enqueue(b.Channel, item{msg: Format(b)})
+			var loc *time.Location
+			if d.Location != nil {
+				loc = d.Location()
+			}
+			d.enqueue(b.Channel, item{msg: FormatIn(b, loc)})
 		}
 	}
 }
