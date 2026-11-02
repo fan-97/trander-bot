@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -107,11 +110,24 @@ func Parse(data []byte) (*Config, error) {
 	return c, nil
 }
 
+// expandEnv expands ${VAR} / $VAR in s and appends the names of variables
+// that are not set to missing (a set-but-empty variable is fine).
+func expandEnv(s string, missing *[]string) string {
+	return os.Expand(s, func(name string) string {
+		v, ok := os.LookupEnv(name)
+		if !ok && !slices.Contains(*missing, name) {
+			*missing = append(*missing, name)
+		}
+		return v
+	})
+}
+
 func (r *rawConfig) build() (*Config, error) {
+	var missing []string
 	c := &Config{
 		Symbols:  r.Symbols,
 		Channels: map[string]ChannelConfig{},
-		Database: DatabaseConfig{DSN: os.ExpandEnv(r.Database.DSN)},
+		Database: DatabaseConfig{DSN: expandEnv(r.Database.DSN, &missing)},
 		Binance:  BinanceConfig{RESTURL: r.Binance.RESTURL, WSURL: r.Binance.WSURL},
 	}
 	if c.Binance.RESTURL == "" {
@@ -124,12 +140,16 @@ func (r *rawConfig) build() (*Config, error) {
 	for name, ch := range r.Channels {
 		params := make(map[string]string, len(ch.Params))
 		for k, v := range ch.Params {
-			params[k] = os.ExpandEnv(v)
+			params[k] = expandEnv(v, &missing)
 		}
 		c.Channels[name] = ChannelConfig{Type: ch.Type, Fallback: ch.Fallback, Params: params}
 	}
 
 	var errs []error
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		errs = append(errs, fmt.Errorf("environment variables not set: %s", strings.Join(missing, ", ")))
+	}
 	for i, rr := range r.Rules {
 		r2 := Rule{
 			ID:       rr.ID,

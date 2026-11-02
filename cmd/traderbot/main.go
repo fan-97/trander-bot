@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -296,8 +298,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	g.Go(func() error {
 		return config.Watch(gctx, cfgPath, raw, func(err error) {
 			log.Error("config reload failed, keeping the previous config", "err", err)
-			mon.Alert(notify.Message{Title: "配置无效", Level: config.LevelCritical,
-				Lines: []string{"配置文件热加载失败，继续使用旧配置", err.Error()}})
+			mon.Alert(invalidConfigMessage("配置文件热加载失败，继续使用旧配置: " + err.Error()))
 		})
 	})
 	// Subscribe before starting the loop so a reload published in between is not missed.
@@ -457,6 +458,7 @@ func startedMessage(c *config.Config) notify.Message {
 // them is logged and takes effect only after a restart.
 func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.Store, refresh func(context.Context) (map[string]bool, error), have map[string]bool,
 	mon *health.Monitor, changed chan<- struct{}, log *slog.Logger) {
+	running := store.Current().Channels // the dispatcher was built from these and never changes
 	for {
 		var c *config.Config
 		select {
@@ -472,8 +474,14 @@ func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.St
 		next, dropped := filterSymbols(c, have)
 		if len(next.Symbols) == 0 {
 			log.Error("config reload: no tradable symbol left, keeping the previous config", "symbols", c.Symbols)
-			mon.Alert(notify.Message{Title: "配置无效", Level: config.LevelCritical,
-				Lines: []string{"热加载后的配置中没有可交易的币种，继续使用旧配置"}})
+			mon.Alert(invalidConfigMessage("热加载后的配置中没有可交易的币种，继续使用旧配置"))
+			continue
+		}
+		// I5: the dispatcher cannot gain channels without a restart, so a rule
+		// pointing at a channel it does not have would silently lose signals.
+		if missing := missingChannels(next, running); len(missing) > 0 {
+			log.Error("config reload: rules reference channels that are not running, keeping the previous config", "channels", missing)
+			mon.Alert(invalidConfigMessage("规则引用了未启动的通知渠道（新增渠道需要重启）: " + strings.Join(missing, ", ") + "，继续使用旧配置"))
 			continue
 		}
 		if len(dropped) > 0 {
@@ -483,6 +491,10 @@ func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.St
 		prev := store.Current()
 		if !reflect.DeepEqual(prev.Channels, next.Channels) {
 			log.Warn("config reload: notification channel changes take effect only after a restart")
+			if !reflect.DeepEqual(running, next.Channels) {
+				mon.Alert(notify.Message{Title: "通知渠道变更需重启", Level: config.LevelWarn,
+					Lines: []string{"配置里的通知渠道（channels）改了，重启后才生效；当前仍使用启动时的渠道"}})
+			}
 		}
 		if prev.Database != next.Database || prev.Binance != next.Binance {
 			log.Warn("config reload: database/binance changes take effect only after a restart")
@@ -496,7 +508,33 @@ func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.St
 			}
 		}
 		log.Info("config reloaded", "symbols", next.Symbols, "rules", len(next.Rules))
+		mon.Alert(notify.Message{Title: "配置已生效", Level: config.LevelInfo,
+			Lines: []string{fmt.Sprintf("币种 %d 个，规则 %d 条", len(next.Symbols), len(next.Rules))}})
 	}
+}
+
+// missingChannels lists channels referenced by next's rules that are not in
+// running (sorted, deduplicated).
+func missingChannels(next *config.Config, running map[string]config.ChannelConfig) []string {
+	var out []string
+	for _, r := range next.Rules {
+		for _, ch := range r.Channels {
+			if _, ok := running[ch]; !ok && !slices.Contains(out, ch) {
+				out = append(out, ch)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// invalidConfigMessage builds a 配置无效 alert. The title carries a short hash
+// of the reason so a different bad edit is not swallowed by the per-title
+// rate limit of the previous one.
+func invalidConfigMessage(reason string) notify.Message {
+	sum := sha256.Sum256([]byte(reason))
+	return notify.Message{Title: "配置无效 #" + hex.EncodeToString(sum[:3]), Level: config.LevelCritical,
+		Lines: []string{reason}}
 }
 
 // warmupPlan returns how many bars to fetch per interval: warmupBars for every
@@ -651,7 +689,13 @@ func registerMetrics(mon *health.Monitor, router *engine.Router, writer *storage
 			Help:        "Notifications dropped because the channel queue was full.",
 			ConstLabels: prometheus.Labels{"channel": name},
 		}, func() float64 { return float64(disp.Dropped(name)) }))
+		mon.Registry().MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "traderbot_notify_failures_total",
+			Help:        "Notifications that failed on every attempt.",
+			ConstLabels: prometheus.Labels{"channel": name},
+		}, func() float64 { return float64(disp.Failures(name)) }))
 	}
+	mon.SetFailingChannels(disp.Failing)
 }
 
 // healthcheckURL turns a listen address into the local /healthz URL.

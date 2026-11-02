@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -74,6 +75,34 @@ func noRecv[T any](t *testing.T, ch <-chan T, what string) {
 	case v := <-ch:
 		t.Fatalf("unexpected %s: %v", what, v)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func isChannelAlert(m Message) bool { return strings.HasPrefix(m.Title, "渠道失败: ") }
+
+// recvMsg is recv that skips 渠道失败 alerts.
+func recvMsg(t *testing.T, ch <-chan Message, what string) Message {
+	t.Helper()
+	for {
+		if m := recv(t, ch, what); !isChannelAlert(m) {
+			return m
+		}
+	}
+}
+
+// noRecvMsg is noRecv that tolerates 渠道失败 alerts.
+func noRecvMsg(t *testing.T, ch <-chan Message, what string) {
+	t.Helper()
+	deadline := time.After(50 * time.Millisecond)
+	for {
+		select {
+		case m := <-ch:
+			if !isChannelAlert(m) {
+				t.Fatalf("unexpected %s: %v", what, m)
+			}
+		case <-deadline:
+			return
+		}
 	}
 }
 
@@ -166,13 +195,14 @@ func TestDispatcher_FallbackAfter3Failures(t *testing.T) {
 	h.advanceWait(t, 2*time.Second)
 	recv(t, a.sent, "attempt 3")
 
-	m := recv(t, b.sent, "fallback delivery")
+	m := recvMsg(t, b.sent, "fallback delivery")
 	if m.Title != "[WARN] 1 signal(s)" {
 		t.Fatalf("fallback title = %q", m.Title)
 	}
-	noRecv(t, b.sent, "second fallback delivery")
-	if a.count() != 3 || b.count() != 1 {
-		t.Fatalf("calls a=%d b=%d, want 3/1", a.count(), b.count())
+	noRecvMsg(t, b.sent, "second fallback delivery")
+	// b gets the fallback plus one 渠道失败 alert about a.
+	if a.count() != 3 || b.count() != 2 {
+		t.Fatalf("calls a=%d b=%d, want 3/2", a.count(), b.count())
 	}
 }
 
@@ -206,7 +236,7 @@ func TestDispatcher_FallbackNotCascaded(t *testing.T) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-	noRecv(t, c.sent, "cascaded delivery to c")
+	noRecvMsg(t, c.sent, "cascaded delivery to c")
 }
 
 func TestDispatcher_SlowChannelDoesNotBlock(t *testing.T) {
@@ -278,7 +308,63 @@ func TestDispatcher_SendSystemReachesAllChannels(t *testing.T) {
 	recv(t, b.sent, "b attempt 2")
 	h.advanceWait(t, 2*time.Second)
 	recv(t, b.sent, "b attempt 3")
-	noRecv(t, c.sent, "system message forwarded to fallback")
+	noRecvMsg(t, c.sent, "system message forwarded to fallback")
+}
+
+// I4: a channel whose delivery finally fails raises one 渠道失败 alert on
+// every OTHER channel (not on itself), at most once per 10 minutes, and is
+// reported by Failures/Failing.
+func TestDispatcher_ChannelFailureAlertsOthers(t *testing.T) {
+	a, b := newFake("a"), newFake("b")
+	a.fail = func(int) error { return errors.New("401 unauthorized") }
+	h := start(t, map[string]Notifier{"a": a, "b": b}, nil, 0)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case d := <-h.waits:
+				h.clk.Advance(d)
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < failingAfter; i++ {
+		h.in <- batch("a", "BTCUSDT")
+	}
+	m := recv(t, b.sent, "渠道失败 alert on b")
+	if m.Title != "渠道失败: a" || !strings.Contains(strings.Join(m.Lines, " "), "401") {
+		t.Fatalf("alert = %+v", m)
+	}
+	deadline := time.After(2 * time.Second)
+	for h.d.Failures("a") != failingAfter {
+		select {
+		case <-deadline:
+			t.Fatalf("Failures(a) = %d, want %d", h.d.Failures("a"), failingAfter)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	noRecv(t, b.sent, "second 渠道失败 alert inside 10 minutes")
+	a.mu.Lock()
+	aCalls := slices.Clone(a.calls)
+	a.mu.Unlock()
+	for _, f := range aCalls {
+		if isChannelAlert(f) {
+			t.Fatalf("failing channel alerted about itself: %+v", f)
+		}
+	}
+	if got := h.d.Failing(); len(got) != 0 {
+		t.Fatalf("Failing before the window elapsed = %v", got)
+	}
+	h.clk.Advance(failingWindow)
+	if got := h.d.Failing(); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("Failing = %v, want [a]", got)
+	}
+	if h.d.Failures("b") != 0 || len(h.d.Failing()) != 1 {
+		t.Fatal("healthy channel b reported as failing")
+	}
 }
 
 func TestDispatcher_ReturnsWhenInputClosed(t *testing.T) {

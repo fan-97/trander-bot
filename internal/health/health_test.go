@@ -385,3 +385,23 @@ func TestRun_ReturnsNilOnCancelAndChecks(t *testing.T) {
 		t.Fatal("Run did not return")
 	}
 }
+
+// I4: a notification channel that keeps failing makes /healthz degraded.
+func TestHealthz_503WhenChannelFailing(t *testing.T) {
+	m, _, _ := newTest(t)
+	m.SetSymbols(nil)
+	m.OnConn(true)
+	var mu sync.Mutex
+	var failing []string
+	m.SetFailingChannels(func() []string { mu.Lock(); defer mu.Unlock(); return failing })
+	if rec := get(m.Handler(), "/healthz"); rec.Code != 200 {
+		t.Fatalf("healthy: %d %s", rec.Code, rec.Body)
+	}
+	mu.Lock()
+	failing = []string{"tg"}
+	mu.Unlock()
+	rec := get(m.Handler(), "/healthz")
+	if rec.Code != 503 || !strings.Contains(rec.Body.String(), `"channels_failing":["tg"]`) {
+		t.Fatalf("failing channel: %d %s", rec.Code, rec.Body)
+	}
+}

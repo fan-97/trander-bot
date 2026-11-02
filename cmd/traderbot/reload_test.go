@@ -49,9 +49,28 @@ func (h *reloadHarness) alertTitles() []string {
 	defer h.mu.Unlock()
 	var out []string
 	for _, a := range h.alerts {
-		out = append(out, a.Title)
+		switch {
+		case a.Title == "配置已生效":
+			continue // the success confirmation is checked on its own
+		case strings.HasPrefix(a.Title, "配置无效 #"):
+			out = append(out, "配置无效") // the hash suffix varies with the reason
+		default:
+			out = append(out, a.Title)
+		}
 	}
 	return out
+}
+
+func (h *reloadHarness) applied() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, a := range h.alerts {
+		if a.Title == "配置已生效" {
+			n++
+		}
+	}
+	return n
 }
 
 func startReload(t *testing.T, initial *config.Config) *reloadHarness {
@@ -183,5 +202,57 @@ func TestReloadLoop_DroppedSymbolsAlert(t *testing.T) {
 	}
 	if h.changedFired() {
 		t.Error("changed signalled although the validated pool is unchanged")
+	}
+}
+
+// I5: a reload whose rules point at a channel the running dispatcher does
+// not have is rejected (signals to it would be silently dropped).
+func TestReloadLoop_RuleOnNewChannelRejected(t *testing.T) {
+	h := startReload(t, mustParse(t, "[btcusdt]", "1"))
+	prev := h.store.Current()
+	c, err := config.Parse([]byte(`
+symbols: [btcusdt]
+rules:
+  - {id: r, interval: 5m, when: close > 1, channels: [w, x]}
+channels:
+  w: {type: webhook, params: {url: "http://x"}}
+  x: {type: webhook, params: {url: "http://y"}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.publish(t, c)
+	if h.store.Current() != prev {
+		t.Error("store replaced although a rule uses a channel that is not running")
+	}
+	if a := h.alertTitles(); !reflect.DeepEqual(a, []string{"配置无效"}) {
+		t.Errorf("alerts = %v, want [配置无效]", a)
+	}
+}
+
+// I5: changing a running channel's params is applied to the store but warns
+// that a restart is needed; a successful reload is confirmed.
+func TestReloadLoop_ChannelChangeWarnsRestart(t *testing.T) {
+	h := startReload(t, mustParse(t, "[btcusdt]", "1"))
+	c, err := config.Parse([]byte(`
+symbols: [btcusdt]
+rules:
+  - {id: r, interval: 5m, when: close > 1, channels: [w]}
+channels:
+  w: {type: webhook, params: {url: "http://changed"}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.publish(t, c)
+	deadline := time.Now().Add(time.Second)
+	for h.applied() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a := h.alertTitles(); !reflect.DeepEqual(a, []string{"通知渠道变更需重启"}) {
+		t.Errorf("alerts = %v, want [通知渠道变更需重启]", a)
+	}
+	if h.applied() != 1 {
+		t.Errorf("配置已生效 sent %d times, want 1", h.applied())
 	}
 }

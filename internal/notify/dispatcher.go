@@ -3,10 +3,12 @@ package notify
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
 	"trader-bot/internal/clock"
+	"trader-bot/internal/config"
 	"trader-bot/internal/signal"
 )
 
@@ -32,6 +34,25 @@ type item struct {
 	msg      Message
 	fallback bool // already a fallback delivery: never forwarded again
 	system   bool // system alert: never forwarded to a fallback
+	health   bool // a 渠道失败 alert: its own failure raises no further alert
+}
+
+const (
+	// channelAlertEvery limits 渠道失败 alerts to one per channel per window.
+	channelAlertEvery = 10 * time.Minute
+	// failingAfter consecutive final failures with no success within
+	// failingWindow mark a channel as failing in /healthz.
+	failingAfter  = 3
+	failingWindow = 10 * time.Minute
+)
+
+// chanStats tracks delivery health of one channel.
+type chanStats struct {
+	failures    int64 // final (all attempts) delivery failures
+	consecutive int
+	lastSuccess time.Time
+	lastAlert   time.Time
+	alerted     bool
 }
 
 // queue is a bounded FIFO that drops its oldest item when full.
@@ -57,6 +78,10 @@ type Dispatcher struct {
 	clk      clock.Clock
 	queues   map[string]*queue
 
+	smu   sync.Mutex
+	stats map[string]*chanStats
+	start time.Time // a channel that never succeeded counts from here
+
 	// pending counts enqueued messages not yet fully handled; it lets Run
 	// know when the queues are drained after its input is closed.
 	pmu     sync.Mutex
@@ -80,11 +105,85 @@ func NewDispatcher(ns map[string]Notifier, fallback map[string]string, queueSize
 		clk:      clk,
 		queues:   make(map[string]*queue, len(ns)),
 		idle:     make(chan struct{}, 1),
+		stats:    make(map[string]*chanStats, len(ns)),
+	}
+	if clk != nil {
+		d.start = clk.Now()
 	}
 	for name := range ns {
 		d.queues[name] = &queue{size: queueSize, wake: make(chan struct{}, 1)}
+		d.stats[name] = &chanStats{}
 	}
 	return d
+}
+
+// Failures returns how many messages channel failed to deliver after all
+// attempts. Unknown channels return 0.
+func (d *Dispatcher) Failures(channel string) int64 {
+	d.smu.Lock()
+	defer d.smu.Unlock()
+	if s := d.stats[channel]; s != nil {
+		return s.failures
+	}
+	return 0
+}
+
+// Failing returns the channels (sorted) whose last failingAfter deliveries
+// all failed with no success in failingWindow.
+func (d *Dispatcher) Failing() []string {
+	now := d.clk.Now()
+	d.smu.Lock()
+	defer d.smu.Unlock()
+	var out []string
+	for name, s := range d.stats {
+		last := s.lastSuccess
+		if last.IsZero() {
+			last = d.start
+		}
+		if s.consecutive >= failingAfter && now.Sub(last) >= failingWindow {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (d *Dispatcher) noteSuccess(name string) {
+	d.smu.Lock()
+	defer d.smu.Unlock()
+	s := d.stats[name]
+	s.consecutive, s.lastSuccess = 0, d.clk.Now()
+	if s.alerted {
+		s.alerted = false
+		d.log().Info("notify: channel recovered", "channel", name)
+	}
+}
+
+// noteFailure records a final delivery failure and, at most once per
+// channelAlertEvery, sends a 渠道失败 alert to every OTHER channel. A failed
+// 渠道失败 alert itself never raises another one.
+func (d *Dispatcher) noteFailure(name string, it item, err error) {
+	now := d.clk.Now()
+	d.smu.Lock()
+	s := d.stats[name]
+	s.failures++
+	s.consecutive++
+	alert := !it.health && (s.lastAlert.IsZero() || now.Sub(s.lastAlert) >= channelAlertEvery)
+	if alert {
+		s.lastAlert, s.alerted = now, true
+	}
+	d.smu.Unlock()
+	if !alert {
+		return
+	}
+	m := Message{Title: "渠道失败: " + name, Level: config.LevelCritical,
+		// Notifier errors are already redacted of tokens and URLs.
+		Lines: []string{"该通知渠道连续发送失败（已重试），请检查 token/URL/网络", err.Error()}}
+	for other := range d.queues {
+		if other != name {
+			d.enqueue(other, item{msg: m, system: true, health: true})
+		}
+	}
 }
 
 func (d *Dispatcher) log() *slog.Logger {
@@ -269,6 +368,7 @@ func (d *Dispatcher) deliver(ctx context.Context, name string, n Notifier, it it
 		err = n.Send(actx, it.msg)
 		cancel()
 		if err == nil {
+			d.noteSuccess(name)
 			return
 		}
 		if ctx.Err() != nil {
@@ -277,6 +377,7 @@ func (d *Dispatcher) deliver(ctx context.Context, name string, n Notifier, it it
 		d.log().Warn("notify: send failed", "channel", name, "attempt", attempt+1, "err", err)
 	}
 	d.log().Error("notify: delivery failed", "channel", name, "attempts", maxAttempts, "err", err, "title", it.msg.Title)
+	d.noteFailure(name, it, err)
 	if it.fallback || it.system {
 		return
 	}

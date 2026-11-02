@@ -35,6 +35,8 @@ type Status struct {
 	Connected bool
 	Stale     []string
 	LastEvent map[string]time.Time // zero time: no event seen yet
+	// ChannelsFailing are notification channels that keep failing (I4).
+	ChannelsFailing []string
 }
 
 type symState struct {
@@ -66,6 +68,7 @@ type Monitor struct {
 	discAlerted  bool
 	symbols      map[string]*symState
 	symbolsFixed bool // SetSymbols called: unknown symbols in OnEvent are ignored
+	failing      func() []string
 
 	rlMu     sync.Mutex
 	lastSent map[string]time.Time
@@ -319,7 +322,20 @@ func (m *Monitor) Snapshot() Status {
 		}
 	}
 	sort.Strings(st.Stale)
+	st.ChannelsFailing = []string{}
+	if m.failing != nil {
+		st.ChannelsFailing = append(st.ChannelsFailing, m.failing()...)
+	}
 	return st
+}
+
+// SetFailingChannels sets the source of failing notification channels
+// reported by /healthz (e.g. Dispatcher.Failing). Call it before serving;
+// f must be safe for concurrent use.
+func (m *Monitor) SetFailingChannels(f func() []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failing = f
 }
 
 // Handler serves /healthz and /metrics.
@@ -337,9 +353,10 @@ func (m *Monitor) healthz(w http.ResponseWriter, _ *http.Request) {
 	case !st.Started:
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "starting"})
-	case !st.Connected || len(st.Stale) > 0:
+	case !st.Connected || len(st.Stale) > 0 || len(st.ChannelsFailing) > 0:
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "degraded", "connected": st.Connected, "stale": st.Stale})
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "degraded", "connected": st.Connected, "stale": st.Stale,
+			"channels_failing": st.ChannelsFailing})
 	default:
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}

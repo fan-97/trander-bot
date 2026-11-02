@@ -10,6 +10,9 @@ import (
 
 func TestLoad_Example(t *testing.T) {
 	t.Setenv("TELEGRAM_TOKEN", "tok")
+	t.Setenv("TELEGRAM_CHAT_ID", "1")
+	t.Setenv("DISCORD_WEBHOOK_URL", "https://discord.example.invalid/api/webhooks/1/x")
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost:5432/db")
 	c, err := Load("../../configs/config.example.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +163,27 @@ func TestValidate_RealtimeOperands(t *testing.T) {
 	ok := `  - {id: a, interval: 5m, trigger: realtime, when: {any: ["close > 100", "change_pct(3) > 2", "volume > 1000", "funding_rate < -0.0005", "oi_change_pct(4) > 10", "liq_volume(5) > 1000000"]}, channels: [tg]}`
 	if _, err := Parse([]byte(head + ok)); err != nil {
 		t.Fatalf("allowed operands rejected: %v", err)
+	}
+}
+
+// I4: a ${VAR} that is not set is a validation error naming the variable
+// (never its value); a variable set to "" is allowed.
+func TestBuild_UnsetEnvVarRejected(t *testing.T) {
+	t.Setenv("TB_TEST_EMPTY", "")
+	cfg := "symbols: [BTCUSDT]\nrules:\n  - {id: a, interval: 1m, when: {all: [\"close > 1\"]}, channels: [tg]}\n" +
+		"channels: {tg: {type: telegram, params: {token: \"${TB_TEST_UNSET_TOKEN}\", chat_id: \"${TB_TEST_EMPTY}\"}}}\n" +
+		"database: {dsn: \"${TB_TEST_UNSET_DSN}\"}\n"
+	_, err := Parse([]byte(cfg))
+	if err == nil {
+		t.Fatal("unset env vars accepted")
+	}
+	for _, want := range []string{"TB_TEST_UNSET_TOKEN", "TB_TEST_UNSET_DSN"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "TB_TEST_EMPTY") {
+		t.Errorf("set-but-empty variable rejected: %v", err)
 	}
 }
 
