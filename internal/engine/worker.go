@@ -52,6 +52,19 @@ type Worker struct {
 
 	contract contract
 	started  bool // Run has begun: liq_volume reads 0 instead of unavailable
+
+	// staleCheck marks signals from closed bars that arrive long after they
+	// closed (gap fill after an outage) as stale: recorded, never delivered.
+	staleCheck bool
+}
+
+// minStaleLag is the floor of staleLag.
+const minStaleLag = 2 * time.Minute
+
+// staleLag is how long after its close a bar may arrive and still count as
+// live: max(2 intervals, 2m).
+func staleLag(iv market.Interval) time.Duration {
+	return max(2*iv.Duration(), minStaleLag)
 }
 
 // NewWorker creates a worker for symbol using the rules cfg applies to it.
@@ -66,6 +79,7 @@ func NewWorker(symbol string, cfg *config.Config, gate *signal.Gate, out chan<- 
 		inds:       map[string]indicator.Indicator{},
 		bars:       map[market.Interval][]market.Kline{},
 		lastClosed: map[market.Interval]time.Time{},
+		staleCheck: true,
 	}
 	w.setConfig(cfg)
 	return w
@@ -197,7 +211,7 @@ func (w *Worker) handle(ctx context.Context, ev market.Event) error {
 	// ones wait for their interval's close like every other rule (R22).
 	for i, r := range w.rules {
 		if m := w.meta[i]; m.contractOnly && m.srcs&src != 0 && r.Trigger == config.TriggerRealtime {
-			if err := w.evaluate(ctx, r, w.values(r.Interval, nil), price); err != nil {
+			if err := w.evaluate(ctx, r, w.values(r.Interval, nil), price, false); err != nil {
 				return err
 			}
 		}
@@ -221,7 +235,7 @@ func (w *Worker) onBar(ctx context.Context, k market.Kline, eval bool) error {
 		live := k
 		for _, r := range w.rules {
 			if r.Interval == iv && r.Trigger == config.TriggerRealtime {
-				if err := w.evaluate(ctx, r, w.values(iv, &live), k.Close); err != nil {
+				if err := w.evaluate(ctx, r, w.values(iv, &live), k.Close, false); err != nil {
 					return err
 				}
 			}
@@ -237,9 +251,10 @@ func (w *Worker) onBar(ctx context.Context, k market.Kline, eval bool) error {
 		return nil
 	}
 	v := w.values(iv, nil)
+	stale := w.staleCheck && w.clk.Now().Sub(k.OpenTime.Add(iv.Duration())) > staleLag(iv)
 	for _, r := range w.rules {
 		if r.Interval == iv {
-			if err := w.evaluate(ctx, r, v, k.Close); err != nil {
+			if err := w.evaluate(ctx, r, v, k.Close, stale); err != nil {
 				return err
 			}
 		}
@@ -256,8 +271,9 @@ func (w *Worker) retain(k market.Kline) {
 }
 
 // evaluate runs r through the gate and emits a Signal on a fire or a
-// cooldown-suppressed edge (R2).
-func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, price float64) error {
+// cooldown-suppressed edge (R2). A fire on a stale bar is emitted with
+// Suppressed="stale": recorded, never delivered.
+func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, price float64, stale bool) error {
 	if r.When == nil {
 		return nil
 	}
@@ -265,6 +281,9 @@ func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, pri
 	fire, suppressed := w.gate.Observe(r.ID, w.symbol, res, r.Cooldown)
 	if !fire && suppressed != "cooldown" {
 		return nil
+	}
+	if fire && stale {
+		suppressed = "stale"
 	}
 	detail := rule.Describe(r.When, v)
 	if detail == "" {

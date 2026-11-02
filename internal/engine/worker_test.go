@@ -74,7 +74,11 @@ func newHarness(t *testing.T, cfg *config.Config) *harness {
 	clk := clock.NewFake(t0.Add(24 * time.Hour))
 	g := signal.NewGate(clk)
 	out := make(chan signal.Signal, 64)
-	return &harness{w: NewWorker(sym, cfg, g, out, clk), gate: g, clk: clk, out: out}
+	w := NewWorker(sym, cfg, g, out, clk)
+	// Most tests feed bars dated long before the harness clock; the stale
+	// check (on by default) is exercised by its own test.
+	w.staleCheck = false
+	return &harness{w: w, gate: g, clk: clk, out: out}
 }
 
 // run feeds evs through Run and returns every emitted signal after Run exits
@@ -147,6 +151,27 @@ func TestWorker_WarmupDoesNotEmit(t *testing.T) {
 	h.w.Warmup(hist5(30, flat))
 	if got := h.drain(); len(got) != 0 {
 		t.Fatalf("warmup emitted %v", ids(got))
+	}
+}
+
+// I2: a closed bar that arrives long after it closed (a gap fill after an
+// outage) still updates indicators, but its signal is recorded as stale and
+// never delivered; the same bar arriving on time fires normally.
+func TestWorker_StaleGapFilledBarSuppressed(t *testing.T) {
+	cfg := `{id: up, interval: 1m, cooldown: 0s, when: {all: ["close > 100"]}, channels: [tg]}`
+	h := newHarness(t, parseCfg(t, cfg))
+	h.w.staleCheck = true
+	// The harness clock is t0+24h; a bar at minute 0 closed ~24h ago.
+	got := h.handle(t, k1(sym, 0, 105, 1, true))
+	if len(got) != 1 || got[0].Suppressed != "stale" {
+		t.Fatalf("stale bar: want one stale-suppressed signal, got %+v", got)
+	}
+
+	fresh := newHarness(t, parseCfg(t, cfg))
+	fresh.w.staleCheck = true
+	minute := int(fresh.clk.Now().Sub(t0)/time.Minute) - 1 // closed just now
+	if got := fresh.handle(t, k1(sym, minute, 105, 1, true)); len(got) != 1 || got[0].Suppressed != "" {
+		t.Fatalf("fresh bar: want one delivered signal, got %+v", got)
 	}
 }
 
