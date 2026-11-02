@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -168,6 +169,21 @@ func (s *Store) WriteKlines(ctx context.Context, ks []market.Kline) error {
 		return fmt.Errorf("storage: write klines: %w", err)
 	}
 	return nil
+}
+
+// LastKlineTime returns the open time of the newest stored bar of (symbol,
+// interval); ok is false when none is stored. It reads the primary-key index.
+func (s *Store) LastKlineTime(ctx context.Context, symbol string, iv market.Interval) (t time.Time, ok bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT open_time FROM klines WHERE symbol = $1 AND interval = $2 ORDER BY open_time DESC LIMIT 1`,
+		symbol, string(iv)).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("storage: last kline time: %w", err)
+	}
+	return t, true, nil
 }
 
 // WriteMarkPrices inserts ms; a sample whose key already exists is ignored.

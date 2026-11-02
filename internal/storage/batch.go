@@ -44,8 +44,10 @@ type Writer struct {
 
 	// Clock drives the flush interval. Defaults to clock.Real.
 	Clock clock.Clock
-	// OnDrop, if set, is called (from Run's goroutine) with the number of
-	// items just dropped because the buffer was full or lost in the final flush.
+	// OnDrop, if set, is called (from Run's goroutine) at most once per flush
+	// interval, and once more at shutdown, with the number of items dropped
+	// since the last call (buffer full, or lost in the final flush). Summing
+	// per tick keeps a burst from becoming one call per item.
 	OnDrop func(n int)
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
@@ -115,13 +117,13 @@ func (w *Writer) Run(ctx context.Context, in <-chan any) error {
 	drop := func(n int) {
 		w.dropped.Add(int64(n))
 		unlogged += int64(n)
-		if w.OnDrop != nil {
-			w.OnDrop(n)
-		}
 	}
 	logDrops := func() {
 		if unlogged > 0 {
 			log.Warn("storage: writer buffer full, dropped oldest", "dropped", unlogged, "total", w.dropped.Load())
+			if w.OnDrop != nil {
+				w.OnDrop(int(unlogged))
+			}
 			unlogged = 0
 		}
 	}

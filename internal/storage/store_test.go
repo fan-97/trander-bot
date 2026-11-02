@@ -244,3 +244,25 @@ func TestStore_RecentKlinesNonPositive(t *testing.T) {
 		}
 	}
 }
+
+func TestStore_LastKlineTime(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, ok, err := s.LastKlineTime(ctx, "LKTUSDT", market.I1h); err != nil || ok {
+		t.Fatalf("empty: ok=%v err=%v", ok, err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var ks []market.Kline
+	for i := 0; i < 3; i++ {
+		ks = append(ks, market.Kline{Symbol: "LKTUSDT", Interval: market.I1h, OpenTime: base.Add(time.Duration(i) * time.Hour),
+			Open: 1, High: 1, Low: 1, Close: 1, Closed: true})
+	}
+	ks = append(ks, market.Kline{Symbol: "LKTUSDT", Interval: market.I5m, OpenTime: base.Add(10 * time.Hour), Closed: true})
+	if err := s.WriteKlines(ctx, ks); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.LastKlineTime(ctx, "LKTUSDT", market.I1h)
+	if err != nil || !ok || !got.Equal(base.Add(2*time.Hour)) {
+		t.Fatalf("got %v ok=%v err=%v, want +2h", got, ok, err)
+	}
+}
