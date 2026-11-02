@@ -62,7 +62,7 @@ channels:
 	}
 	stream := binance.NewStream("ws://127.0.0.1:1/market", rest, clk, nil)
 	alerts := &alertLog{}
-	return warmup(rest, stream, config.NewStore(cfg), clk, alerts.add, slog.Default()), alerts
+	return warmup(rest, stream, config.NewStore(cfg), clk, alerts.add, nil, slog.Default()), alerts
 }
 
 func TestWarmup_TimeoutReturnsPartialHistoryAndAlerts(t *testing.T) {
@@ -96,6 +96,109 @@ func TestWarmup_ErrorAlertsAndStartsCold(t *testing.T) {
 	}
 	if a := alerts.titles(); len(a) != 1 || a[0] != "预热失败: BTCUSDT" {
 		t.Errorf("alerts = %v", a)
+	}
+}
+
+// I7: fetched warmup bars are also handed to persist (the database writer).
+func TestWarmup_PersistsFetchedBars(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 30, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d := time.Minute
+		if r.URL.Query().Get("interval") == "5m" {
+			d = 5 * time.Minute
+		}
+		open := now.Truncate(d).Add(-d)
+		fmt.Fprintf(w, `[[%d,"1","1","1","1","1",%d,"1"]]`, open.UnixMilli(), open.Add(d).UnixMilli()-1)
+	}))
+	t.Cleanup(srv.Close)
+	clk := clock.NewFake(now)
+	rest := binance.NewREST(srv.URL, 0)
+	rest.Clock = clk
+	cfg, err := config.Parse([]byte("symbols: [BTCUSDT]\nrules:\n  - {id: r, interval: 5m, when: close > 1, channels: [w]}\nchannels:\n  w: {type: webhook, params: {url: \"http://x\"}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted []market.Kline
+	hist := warmup(rest, binance.NewStream("ws://127.0.0.1:1/market", rest, clk, nil), config.NewStore(cfg), clk,
+		func(notify.Message) {}, func(ks []market.Kline) { persisted = append(persisted, ks...) }, slog.Default())
+	if _, err := hist(context.Background(), "BTCUSDT"); err != nil {
+		t.Fatal(err)
+	}
+	ivs := map[market.Interval]bool{}
+	for _, k := range persisted {
+		ivs[k.Interval] = true
+	}
+	if len(persisted) != 2 || !ivs[market.I1m] || !ivs[market.I5m] {
+		t.Fatalf("persisted = %+v, want one 1m and one 5m bar", persisted)
+	}
+}
+
+// I8: 预热失败 alerts within the window go out as one message; a lone one
+// keeps its per-symbol title; other alerts pass straight through.
+func TestBatchWarmupAlerts(t *testing.T) {
+	clk := clock.NewFake(time.Unix(0, 0))
+	got := &alertLog{}
+	alert := batchWarmupAlerts(context.Background(), clk, 5*time.Second, got.add)
+	for _, s := range []string{"AUSDT", "BUSDT", "CUSDT"} {
+		alert(notify.Message{Title: "预热失败: " + s, Lines: []string{"x", "boom"}})
+	}
+	alert(notify.Message{Title: "其它"})
+	if a := got.titles(); len(a) != 1 || a[0] != "其它" {
+		t.Fatalf("before window: %v", a)
+	}
+	eventuallyMain(t, func() bool { clk.Advance(5 * time.Second); return len(got.titles()) == 2 })
+	if a := got.titles(); a[1] != "预热失败: 3 个币种" || !strings.Contains(strings.Join(got.ms[1].Lines, " "), "AUSDT, BUSDT, CUSDT") {
+		t.Fatalf("aggregated = %v %v", a, got.ms[1].Lines)
+	}
+	alert(notify.Message{Title: "预热失败: DUSDT", Lines: []string{"x", "boom"}})
+	eventuallyMain(t, func() bool { clk.Advance(5 * time.Second); return len(got.titles()) == 3 })
+	if a := got.titles(); a[2] != "预热失败: DUSDT" {
+		t.Fatalf("lone failure = %v", a)
+	}
+}
+
+// I6: a writer failing for dbFailingAfter raises one critical alert, then
+// one recovery when it succeeds again.
+func TestWatchWriter(t *testing.T) {
+	clk := clock.NewFake(time.Unix(0, 0))
+	fw := &fakeFailing{}
+	got := &alertLog{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { watchWriter(ctx, clk, fw, got.add, slog.Default()); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	fw.set(clk.Now())
+	eventuallyMain(t, func() bool { clk.Advance(dbCheckEvery); return len(got.titles()) == 1 })
+	if a := got.titles(); a[0] != "数据库写入失败" || clk.Now().Sub(time.Unix(0, 0)) < dbFailingAfter {
+		t.Fatalf("alerts = %v at %v", a, clk.Now())
+	}
+	fw.set(time.Time{})
+	eventuallyMain(t, func() bool { clk.Advance(dbCheckEvery); return len(got.titles()) == 2 })
+	if a := got.titles(); a[1] != "数据库写入恢复" {
+		t.Fatalf("alerts = %v", a)
+	}
+}
+
+type fakeFailing struct {
+	mu    sync.Mutex
+	since time.Time
+}
+
+func (f *fakeFailing) set(t time.Time) { f.mu.Lock(); f.since = t; f.mu.Unlock() }
+func (f *fakeFailing) FailingSince() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.since
+}
+
+func eventuallyMain(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 

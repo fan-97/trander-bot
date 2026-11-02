@@ -50,7 +50,17 @@ type Writer struct {
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 
-	dropped atomic.Int64
+	dropped      atomic.Int64
+	failingSince atomic.Int64 // UnixNano of the first failed flush in a row; 0 when healthy
+}
+
+// FailingSince returns when flushes started failing continuously, or the zero
+// time when the last flush succeeded (I6). Safe for concurrent use.
+func (w *Writer) FailingSince() time.Time {
+	if ns := w.failingSince.Load(); ns != 0 {
+		return time.Unix(0, ns)
+	}
+	return time.Time{}
 }
 
 // NewWriter returns a Writer flushing every batchSize items (default 500) or
@@ -141,6 +151,11 @@ func (w *Writer) Run(ctx context.Context, in <-chan any) error {
 	finish := func(failed []any) {
 		inflight = 0
 		failing = len(failed) > 0
+		if !failing {
+			w.failingSince.Store(0)
+		} else if w.failingSince.Load() == 0 {
+			w.failingSince.Store(clk.Now().UnixNano())
+		}
 		if failing {
 			buf = append(failed, buf...)
 			trim()

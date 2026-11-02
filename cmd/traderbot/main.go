@@ -21,6 +21,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -54,6 +55,14 @@ const (
 	connectDeadline = 2 * time.Minute
 	// pollEvery is the open interest / long-short sampling period.
 	pollEvery = 5 * time.Minute
+	// warmupAlertWindow collects 预热失败 alerts into one message (I8).
+	warmupAlertWindow = 5 * time.Second
+	// dbFailingAfter: continuous write failure this long raises 数据库写入失败 (I6).
+	dbFailingAfter = 2 * time.Minute
+	// dbCheckEvery is how often watchWriter looks at the writer.
+	dbCheckEvery = 10 * time.Second
+	// maxListedSymbols caps the symbols named in one aggregated alert.
+	maxListedSymbols = 20
 
 	eventBuffer  = 4096
 	routerBuffer = 4096
@@ -270,7 +279,21 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	symbols := func() []string { return store.Current().Symbols }
 
 	stream := binance.NewStream(cfg.Binance.WSURL, rest, clk, mon.OnConn)
-	router := engine.NewRouter(store, signal.NewGate(clk), signals, clk, warmup(rest, stream, store, clk, mon.Alert, log))
+	persistWarmup := func(ks []market.Kline) {
+		for _, k := range ks {
+			if !k.Closed {
+				continue
+			}
+			select {
+			case writerIn <- market.KlineEvent{Kline: k}:
+			case <-gctx.Done():
+				return
+			}
+		}
+	}
+	warmAlert := batchWarmupAlerts(gctx, clk, warmupAlertWindow, mon.Alert)
+	router := engine.NewRouter(store, signal.NewGate(clk), signals, clk,
+		warmup(rest, stream, store, clk, warmAlert, persistWarmup, log))
 	batcher := signal.NewBatcher(clk, func() config.NotifyConfig { return store.Current().Notify }, batches,
 		func(s signal.Signal) { // every signal, delivered or suppressed, is persisted
 			select {
@@ -334,6 +357,10 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	})
 	g.Go(func() error {
 		logStats(gctx, clk, router, &fanBlocked, log)
+		return nil
+	})
+	g.Go(func() error {
+		watchWriter(gctx, clk, writer, mon.Alert, log)
 		return nil
 	})
 	g.Go(func() error {
@@ -560,9 +587,19 @@ func warmupPlan(ivs []market.Interval) map[market.Interval]int {
 // detection with the last closed bar. A failure alerts ("预热失败: SYMBOL");
 // on timeout the bars fetched so far are returned, otherwise the error (the
 // worker then starts cold). A shutdown neither alerts nor logs.
+//
+// persist, if set, receives the fetched bars so the database also holds them
+// (I7; klines are upserted, so overlaps with live bars are harmless).
 func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk clock.Clock,
-	alert func(notify.Message), log *slog.Logger) engine.HistoryFunc {
-	return func(parent context.Context, symbol string) (map[market.Interval][]market.Kline, error) {
+	alert func(notify.Message), persist func([]market.Kline), log *slog.Logger) engine.HistoryFunc {
+	return func(parent context.Context, symbol string) (out map[market.Interval][]market.Kline, err error) {
+		defer func() {
+			if persist != nil && err == nil {
+				for _, ks := range out {
+					persist(ks)
+				}
+			}
+		}()
 		ctx, cancel := context.WithTimeout(parent, warmupTimeout)
 		defer cancel()
 		plan := warmupPlan(store.Current().Intervals)
@@ -573,7 +610,7 @@ func warmup(rest *binance.REST, stream *binance.Stream, store *config.Store, clk
 		sort.Slice(ivs, func(i, j int) bool { return ivs[i].Duration() < ivs[j].Duration() })
 
 		now := clk.Now()
-		out := make(map[market.Interval][]market.Kline, len(plan))
+		out = make(map[market.Interval][]market.Kline, len(plan))
 		total := 0
 		for _, iv := range ivs {
 			n, d := plan[iv], iv.Duration()
@@ -671,10 +708,104 @@ func logStats(ctx context.Context, clk clock.Clock, router *engine.Router, fanBl
 	}
 }
 
+// failingSincer is the part of storage.Writer watchWriter needs.
+type failingSincer interface{ FailingSince() time.Time }
+
+// watchWriter raises one critical 数据库写入失败 once database writes have
+// failed continuously for dbFailingAfter, and one info 数据库写入恢复 when they
+// succeed again (I6).
+func watchWriter(ctx context.Context, clk clock.Clock, w failingSincer, alert func(notify.Message), log *slog.Logger) {
+	alerted := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-clk.After(dbCheckEvery):
+		}
+		since := w.FailingSince()
+		switch {
+		case !alerted && !since.IsZero() && clk.Now().Sub(since) >= dbFailingAfter:
+			alerted = true
+			log.Error("database writes keep failing", "since", since)
+			alert(notify.Message{Title: "数据库写入失败", Level: config.LevelCritical, Lines: []string{
+				fmt.Sprintf("从 %s 起数据库写入一直失败；数据暂存在内存（最多 1 万条，超出丢最旧的），重启会丢失", since.UTC().Format("15:04:05 UTC")),
+			}})
+		case alerted && since.IsZero():
+			alerted = false
+			log.Info("database writes recovered")
+			alert(notify.Message{Title: "数据库写入恢复", Level: config.LevelInfo, Lines: []string{"数据库写入已恢复"}})
+		}
+	}
+}
+
+// batchWarmupAlerts wraps alert so that 预热失败 alerts arriving within window
+// of the first one go out as a single message (I8); other alerts pass
+// through. A lone failure keeps its per-symbol message.
+func batchWarmupAlerts(ctx context.Context, clk clock.Clock, window time.Duration, alert func(notify.Message)) func(notify.Message) {
+	const prefix = "预热失败: "
+	var (
+		mu      sync.Mutex
+		pending []notify.Message
+	)
+	flush := func() {
+		mu.Lock()
+		ms := pending
+		pending = nil
+		mu.Unlock()
+		switch len(ms) {
+		case 0:
+			return
+		case 1:
+			alert(ms[0])
+			return
+		}
+		syms := make([]string, 0, len(ms))
+		for _, m := range ms {
+			syms = append(syms, strings.TrimPrefix(m.Title, prefix))
+		}
+		listed := strings.Join(syms[:min(len(syms), maxListedSymbols)], ", ")
+		if len(syms) > maxListedSymbols {
+			listed += " …"
+		}
+		alert(notify.Message{Title: fmt.Sprintf("预热失败: %d 个币种", len(ms)), Level: config.LevelWarn, Lines: []string{
+			"以下币种的历史 K 线拉取失败或超时，相关周期要等实时 K 线积累后才可用: " + listed,
+			ms[0].Lines[len(ms[0].Lines)-1], // one example error
+		}})
+	}
+	return func(m notify.Message) {
+		if !strings.HasPrefix(m.Title, prefix) {
+			alert(m)
+			return
+		}
+		mu.Lock()
+		pending = append(pending, m)
+		first := len(pending) == 1
+		mu.Unlock()
+		if first {
+			go func() {
+				select {
+				case <-clk.After(window):
+					flush()
+				case <-ctx.Done():
+				}
+			}()
+		}
+	}
+}
+
 func registerMetrics(mon *health.Monitor, router *engine.Router, writer *storage.Writer, disp *notify.Dispatcher, cfg *config.Config) {
 	mon.RegisterCounterFunc("traderbot_router_backpressure_total",
 		"Times a market event waited for a full per-symbol worker channel.",
 		func() float64 { return float64(router.Backpressure()) })
+	mon.Registry().MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "traderbot_writer_failing",
+		Help: "1 while database writes are failing continuously.",
+	}, func() float64 {
+		if writer.FailingSince().IsZero() {
+			return 0
+		}
+		return 1
+	}))
 	mon.RegisterCounterFunc("traderbot_writer_dropped_total",
 		"Items dropped by the storage writer because its buffer was full.",
 		func() float64 { return float64(writer.Dropped()) })

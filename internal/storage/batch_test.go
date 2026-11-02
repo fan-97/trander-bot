@@ -304,6 +304,24 @@ func TestWriterUnit_FailedFlushRetried(t *testing.T) {
 	}
 }
 
+// I6: FailingSince reports when flushes started failing continuously, and
+// clears on the first successful flush.
+func TestWriterUnit_FailingSince(t *testing.T) {
+	fs := &fakeSink{failSignals: 1}
+	clk := clock.NewFake(t0)
+	r := start(t, fs, 2, time.Hour, clk)
+	if !r.w.FailingSince().IsZero() {
+		t.Fatal("failing before any flush")
+	}
+	r.in <- sig(1)
+	r.in <- sig(2) // size flush, fails
+	eventually(t, "failing reported", func() bool { return r.w.FailingSince().Equal(t0) })
+	eventually(t, "recovered", func() bool {
+		clk.Advance(time.Hour)
+		return len(fs.snapshotSigs()) == 2 && r.w.FailingSince().IsZero()
+	})
+}
+
 func TestWriterUnit_FinalFlushOnCancel(t *testing.T) {
 	fs := &fakeSink{}
 	r := start(t, fs, 500, time.Hour, clock.NewFake(t0))
