@@ -150,6 +150,20 @@ func TestWorker_WarmupDoesNotEmit(t *testing.T) {
 	}
 }
 
+// R23: a condition already true at the end of warmup (i.e. before a restart)
+// is primed as seen, so the first live close does not re-announce it.
+func TestWorker_WarmupPrimesGate(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: up, interval: 5m, cooldown: 0s, when: {all: ["close > 50"]}, channels: [tg]}`))
+	h.w.Warmup(hist5(30, flat))
+	if got := h.handle(t, feed5(30, 100, 10)...); len(got) != 0 {
+		t.Fatalf("re-fired a condition that was true before start: %v", ids(got))
+	}
+	h.handle(t, feed5(31, 40, 10)...) // goes False
+	if got := h.handle(t, feed5(32, 100, 10)...); len(got) != 1 {
+		t.Fatalf("did not fire on a real False->True edge: %v", ids(got))
+	}
+}
+
 func TestWorker_NoFireOnUnclosed(t *testing.T) {
 	h := newHarness(t, parseCfg(t, pumpRule))
 	h.w.Warmup(hist5(30, flat))
@@ -336,13 +350,15 @@ func TestWorker_RemovedRuleForgetsGate(t *testing.T) {
 	}
 }
 
-func TestWorker_ChangedRuleForgetsGate(t *testing.T) {
+// A changed rule re-arms its edge but keeps its cooldown, so tuning a
+// threshold while the condition holds cannot re-push inside the cooldown.
+func TestWorker_ChangedRuleResetsEdgeKeepsCooldown(t *testing.T) {
 	h := newHarness(t, parseCfg(t, upCooldown))
 	h.handle(t, k1(sym, 0, 105, 1, true))
 	h.w.reconfigure(parseCfg(t, `{id: up, interval: 1m, when: {all: ["close > 101"]}, cooldown: 1h, channels: [tg]}`))
 	got := h.handle(t, k1(sym, 1, 105, 1, true))
-	if len(got) != 1 || got[0].Suppressed != "" {
-		t.Fatalf("changed rule did not fire fresh: %+v", got)
+	if len(got) != 1 || got[0].Suppressed != "cooldown" {
+		t.Fatalf("changed rule: want a cooldown-suppressed edge, got %+v", got)
 	}
 	// Unchanged rule keeps its gate state: still True, no new edge.
 	h.w.reconfigure(parseCfg(t, `{id: up, interval: 1m, when: {all: ["close > 101"]}, cooldown: 1h, channels: [tg, tg]}`))

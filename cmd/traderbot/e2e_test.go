@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +18,9 @@ import (
 
 	"github.com/coder/websocket"
 
+	"trader-bot/internal/clock"
 	"trader-bot/internal/market"
+	"trader-bot/internal/notify"
 	"trader-bot/internal/signal"
 )
 
@@ -361,7 +365,8 @@ binance:
 	sink := &memSink{}
 	start := time.Now()
 	err := run(context.Background(), cfgPath, "127.0.0.1:0", Deps{
-		OpenStore: func(context.Context, string) (Store, error) { return sink, nil },
+		OpenStore:         func(context.Context, string) (Store, error) { return sink, nil },
+		StartupRetryWaits: []time.Duration{10 * time.Millisecond, 10 * time.Millisecond},
 	})
 	if err == nil {
 		t.Fatal("run succeeded against a failing exchangeInfo")
@@ -371,5 +376,24 @@ binance:
 	}
 	if got := tg.matching("启动失败"); len(got) != 1 || !strings.Contains(got[0], "exchange") {
 		t.Errorf("telegram = %q, want one 启动失败 message naming the error", tg.matching(""))
+	}
+	// Retries announce themselves once, not once per attempt.
+	if got := tg.matching("启动重试中"); len(got) != 1 {
+		t.Errorf("启动重试中 messages = %d, want 1", len(got))
+	}
+}
+
+// A transient startup failure is retried in-process instead of exiting.
+func TestRetryStartup_RecoversAfterTransientFailure(t *testing.T) {
+	disp := notify.NewDispatcher(nil, nil, 10, clock.Real{})
+	n := 0
+	err := retryStartup(context.Background(), []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}, disp, "x", slog.Default(), func() error {
+		if n++; n < 3 {
+			return errors.New("down")
+		}
+		return nil
+	})
+	if err != nil || n != 3 {
+		t.Fatalf("err=%v attempts=%d, want nil after 3", err, n)
 	}
 }

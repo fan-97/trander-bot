@@ -180,3 +180,44 @@ func TestGate_ForgetRuleSymbol(t *testing.T) {
 		t.Fatal("r1 ETH wrongly forgotten")
 	}
 }
+
+// R23: Prime marks a condition already true at boot as seen without firing,
+// so it fires only after going False->True again.
+func TestGate_PrimeTrueSuppressesFirstEdge(t *testing.T) {
+	g := NewGate(clock.NewFake(time.Unix(0, 0)))
+	g.Prime("r", "BTC", rule.True)
+	if f, _ := g.Observe("r", "BTC", rule.True, 0); f {
+		t.Fatal("primed-true condition fired")
+	}
+	g.Observe("r", "BTC", rule.False, 0)
+	if f, _ := g.Observe("r", "BTC", rule.True, 0); !f {
+		t.Fatal("did not fire after False->True")
+	}
+	// Priming False (or Unknown) leaves the first edge alive.
+	g.Prime("q", "BTC", rule.False)
+	g.Prime("u", "BTC", rule.Unknown)
+	for _, id := range []string{"q", "u"} {
+		if f, _ := g.Observe(id, "BTC", rule.True, 0); !f {
+			t.Fatalf("%s: first edge suppressed", id)
+		}
+	}
+}
+
+// ResetEdge clears the edge state but keeps the cooldown, so editing a rule
+// cannot be used to bypass it.
+func TestGate_ResetEdgeKeepsCooldown(t *testing.T) {
+	clk := clock.NewFake(time.Unix(0, 0))
+	g := NewGate(clk)
+	if f, _ := g.Observe("r", "BTC", rule.True, time.Hour); !f {
+		t.Fatal("first edge")
+	}
+	g.ResetEdge("r", "BTC")
+	if f, s := g.Observe("r", "BTC", rule.True, time.Hour); f || s != "cooldown" {
+		t.Fatalf("after reset: fire=%v suppressed=%q, want cooldown", f, s)
+	}
+	clk.Advance(time.Hour)
+	g.ResetEdge("r", "BTC")
+	if f, _ := g.Observe("r", "BTC", rule.True, time.Hour); !f {
+		t.Fatal("did not fire after cooldown")
+	}
+}

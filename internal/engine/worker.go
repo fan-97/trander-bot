@@ -107,6 +107,23 @@ func (w *Worker) Warmup(history map[market.Interval][]market.Kline) {
 	if n := len(ones); n > 0 {
 		w.lastPrice = ones[n-1].Close
 	}
+	w.primeGate()
+}
+
+// primeGate evaluates every rule once on the warmed-up state and seeds the
+// gate with the result without emitting, so conditions already true before
+// a (re)start are not announced again (R23). Rules whose data is not ready
+// evaluate Unknown and are left unprimed.
+func (w *Worker) primeGate() {
+	for _, r := range w.rules {
+		if r.When == nil || w.aggs[r.Interval] == nil {
+			continue
+		}
+		if _, ok := w.lastClosed[r.Interval]; !ok {
+			continue
+		}
+		w.gate.Prime(r.ID, w.symbol, rule.Eval(r.When, w.values(r.Interval, nil)))
+	}
 }
 
 func sortedClosed(ks []market.Kline) []market.Kline {
@@ -273,17 +290,20 @@ func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, pri
 }
 
 // reconfigure applies a new config: gate state is dropped for this symbol's
-// rules that were removed or whose When/Interval changed, then indicators are
-// rebuilt (by replaying retained bars). Contract state is kept.
+// rules that were removed; a rule whose When/Interval changed only has its
+// edge reset, so editing a threshold cannot bypass the cooldown. Indicators
+// are rebuilt (by replaying retained bars). Contract state is kept.
 func (w *Worker) reconfigure(cfg *config.Config) {
 	next := map[string]config.Rule{}
 	for _, r := range cfg.RulesFor(w.symbol) {
 		next[r.ID] = r
 	}
 	for _, old := range w.rules {
-		n, ok := next[old.ID]
-		if !ok || n.Interval != old.Interval || !reflect.DeepEqual(n.When, old.When) {
+		switch n, ok := next[old.ID]; {
+		case !ok:
 			w.gate.ForgetRuleSymbol(old.ID, w.symbol)
+		case n.Interval != old.Interval || !reflect.DeepEqual(n.When, old.When):
+			w.gate.ResetEdge(old.ID, w.symbol)
 		}
 	}
 	w.setConfig(cfg)

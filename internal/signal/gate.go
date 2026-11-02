@@ -75,6 +75,36 @@ func (g *Gate) Observe(ruleID, symbol string, r rule.Result, cooldown time.Durat
 	return false, ""
 }
 
+// Prime seeds the edge state of (ruleID, symbol) from a result computed
+// before going live (warmup), without firing or touching the cooldown. A
+// condition already True at boot then counts as seen and fires only after it
+// goes False->True again, so a restart does not re-announce it (R23).
+// Unknown leaves the state unchanged.
+func (g *Gate) Prime(ruleID, symbol string, r rule.Result) {
+	if r == rule.Unknown {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	k := key{ruleID, symbol}
+	s := g.st[k]
+	if s == nil {
+		s = &state{}
+		g.st[k] = s
+	}
+	s.last = r == rule.True
+}
+
+// ResetEdge clears the edge state of (ruleID, symbol) but keeps its cooldown,
+// so a rule edited on reload re-arms without bypassing the cooldown.
+func (g *Gate) ResetEdge(ruleID, symbol string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if s := g.st[key{ruleID, symbol}]; s != nil {
+		s.last = false
+	}
+}
+
 // Forget drops all state for a rule (every symbol).
 func (g *Gate) Forget(ruleID string) {
 	g.mu.Lock()

@@ -87,6 +87,37 @@ type Deps struct {
 	Clock clock.Clock
 	// OpenStore opens storage for the configured DSN; defaults to storage.Open.
 	OpenStore func(ctx context.Context, dsn string) (Store, error)
+	// StartupRetryWaits are the waits between startup retries of storage and
+	// exchangeInfo; nil means defaultStartupRetryWaits.
+	StartupRetryWaits []time.Duration
+}
+
+// defaultStartupRetryWaits rides out a short DB or Binance hiccup at boot
+// (about a minute in total) instead of exiting into a restart loop.
+var defaultStartupRetryWaits = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
+
+// retryStartup runs fn, retrying after each of waits. The first failure sends
+// one "启动重试中" warning (not one per attempt); the last error is returned.
+// The waits are real time: this runs before the clock-driven components start.
+func retryStartup(ctx context.Context, waits []time.Duration, disp *notify.Dispatcher, what string, log *slog.Logger, fn func() error) error {
+	err := fn()
+	if err == nil {
+		return nil
+	}
+	disp.SendSystem(notify.Message{Title: "启动重试中", Level: config.LevelWarn,
+		Lines: []string{what + " 失败，正在重试", err.Error()}})
+	for _, w := range waits {
+		log.Warn("startup step failed, retrying", "step", what, "in", w, "err", err)
+		select {
+		case <-time.After(w):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if err = fn(); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func main() {
@@ -169,8 +200,15 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		return err
 	}
 
-	st, err := openStore(ctx, cfg.Database.DSN)
-	if err != nil {
+	waits := deps.StartupRetryWaits
+	if waits == nil {
+		waits = defaultStartupRetryWaits
+	}
+	var st Store
+	if err := retryStartup(ctx, waits, disp, "数据库连接", log, func() (err error) {
+		st, err = openStore(ctx, cfg.Database.DSN)
+		return err
+	}); err != nil {
 		return fatal(fmt.Errorf("open storage: %w", err))
 	}
 	defer st.Close() // deferred first, so it runs after everything else has stopped
@@ -182,8 +220,11 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	if deps.HTTPClient != nil {
 		rest.HTTP = deps.HTTPClient
 	}
-	have, err := exchangeSymbols(ctx, rest)
-	if err != nil {
+	var have map[string]bool
+	if err := retryStartup(ctx, waits, disp, "币安 exchangeInfo", log, func() (err error) {
+		have, err = exchangeSymbols(ctx, rest)
+		return err
+	}); err != nil {
 		return fatal(fmt.Errorf("load exchange symbols: %w", err))
 	}
 	active, dropped := filterSymbols(cfg, have)
@@ -312,6 +353,8 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 
 	log.Info("traderbot started", "symbols", active.Symbols, "intervals", active.Intervals,
 		"rules", len(active.Rules), "channels", len(active.Channels), "http", ln.Addr().String())
+	// Doubles as a channel self-test, and explains any signal right after a restart.
+	disp.SendSystem(startedMessage(active))
 	if err := g.Wait(); err != nil {
 		if ctx.Err() == nil {
 			notifyFatal(disp, "运行失败", err, log)
@@ -390,6 +433,21 @@ func filterSymbols(c *config.Config, have map[string]bool) (*config.Config, []st
 func droppedMessage(dropped []string) notify.Message {
 	return notify.Message{Title: "币种已忽略", Level: config.LevelWarn,
 		Lines: []string{"以下币种不是可交易的 U 本位永续合约，已忽略: " + strings.Join(dropped, ", ")}}
+}
+
+// startedMessage is sent once to every channel at startup.
+func startedMessage(c *config.Config) notify.Message {
+	chans := make([]string, 0, len(c.Channels))
+	for name := range c.Channels {
+		chans = append(chans, name)
+	}
+	sort.Strings(chans)
+	return notify.Message{Title: "traderbot 已启动", Level: config.LevelInfo, Lines: []string{
+		"币种: " + strings.Join(c.Symbols, ", "),
+		fmt.Sprintf("规则: %d 条", len(c.Rules)),
+		"通知渠道: " + strings.Join(chans, ", "),
+		"收到这条说明该渠道可用；重启前已满足的条件不会重复推送。",
+	}}
 }
 
 // reloadLoop applies each config published by config.Watch: it re-validates
