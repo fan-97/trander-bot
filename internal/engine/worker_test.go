@@ -648,6 +648,39 @@ func TestValues_ProvisionalChangePctAndVolume(t *testing.T) {
 	}
 }
 
+func TestValues_ProvisionalAmplitudeAndVolumeRatio(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: rt, interval: 5m, trigger: realtime, when: {all: ["amplitude_pct > 3", "volume_ratio(3) > 1.5", "high > 1", "low > 1", "open > 1"]}, channels: [tg]}`))
+	// closes 100..129, volumes 10,20,30,... ; bars are flat (H=L=C)
+	h.w.Warmup(hist5(30, func(i int) (float64, float64) { return 100 + float64(i), float64(10 * (i + 1)) }))
+	live := market.Kline{Symbol: sym, Interval: market.I5m, OpenTime: t0.Add(150 * time.Minute),
+		Open: 130, High: 134, Low: 128, Close: 131, Volume: 900}
+	v := h.w.values(market.I5m, &live)
+	want := map[string]float64{
+		"amplitude_pct":   (134.0 - 128) / 129 * 100, // vs last closed close
+		"volume_ratio(3)": 900.0 / ((280 + 290 + 300) / 3.0),
+		"high":            134, "low": 128, "open": 130,
+	}
+	for _, o := range ruleFuncs(h.w.rules[0]) {
+		c, p, ok := v.Get(o)
+		w := want[o.String()]
+		if !ok || abs(c-w) > 1e-9 {
+			t.Fatalf("%s=%v ok=%v want %v", o, c, ok, w)
+		}
+		if o.String() == "volume_ratio(3)" && abs(p-300.0/((270+280+290)/3.0)) > 1e-9 {
+			t.Fatalf("volume_ratio prev=%v (last closed bar's ratio)", p)
+		}
+		if o.String() == "amplitude_pct" && p != 0 {
+			t.Fatalf("amplitude_pct prev=%v (flat closed bar)", p)
+		}
+	}
+	// not enough closed bars: unknown, never a fire
+	h2 := newHarness(t, parseCfg(t, `{id: rt, interval: 5m, trigger: realtime, when: {all: ["volume_ratio(3) > 1.5"]}, channels: [tg]}`))
+	h2.w.Warmup(hist5(2, flat))
+	if _, _, ok := h2.w.values(market.I5m, &live).Get(ruleFuncs(h2.w.rules[0])[0]); ok {
+		t.Fatal("volume_ratio(3) defined with 2 closed bars")
+	}
+}
+
 func ruleFuncs(r config.Rule) []rule.Operand { return rule.Funcs(r.When) }
 func abs(x float64) float64                  { return math.Abs(x) }
 func isNaN(x float64) bool                   { return math.IsNaN(x) }

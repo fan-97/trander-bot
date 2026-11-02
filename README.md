@@ -94,6 +94,24 @@ rules:
     cooldown: 1h
     channels: [telegram]
 
+  - id: fast_move_5m             # 盘中 5 分钟快速波动
+    interval: 5m
+    trigger: realtime
+    when:
+      all:
+        - amplitude_pct > 3          # 这根 5m 振幅超过 3%
+        - volume_ratio(20) > 1.5     # 成交量已达前 20 根均量的 1.5 倍
+    channels: [telegram]
+
+  - id: wick_down                  # 下插针：急跌后被拉回，收盘确认
+    interval: 5m
+    when:
+      all:
+        - lower_wick_atr(14) > 2     # 下影线超过 2 倍 ATR
+        - wick_body_ratio > 3        # 影线是实体的 3 倍以上
+        - volume_ratio(20) > 2
+    channels: [telegram]
+
   - id: golden_cross
     interval: 4h
     when: cross_up(ema(12), ema(26))
@@ -122,6 +140,11 @@ K 线指标（在规则的 `interval` 上按收盘 K 线计算）：
 | `change_pct(n)` | 1 | n 根涨跌幅（%）：`(C / C[n] - 1) * 100` |
 | `highest(n)` | 1 | 前 n 根最高价（不含当前，用于突破判断） |
 | `lowest(n)` | 1 | 前 n 根最低价（不含当前） |
+| `open` / `high` / `low` | 0 | 当根开盘价 / 最高价 / 最低价 |
+| `amplitude_pct` | 0 | 振幅（%）：`(最高 - 最低) / 前一根收盘 * 100` |
+| `upper_wick_pct` / `lower_wick_pct` | 0 | 上 / 下影线长度占收盘价的 %（上影线 = 最高 - max(开, 收)，下影线 = min(开, 收) - 最低） |
+| `upper_wick_atr(n)` / `lower_wick_atr(n)` | 1 | 上 / 下影线长度是 ATR(n) 的几倍；ATR 只用之前的 K 线，不含当根，插针本身不会把比值拉低 |
+| `wick_body_ratio` | 0 | 较长那根影线 ÷ 实体；实体最小按收盘价的 0.01% 计，十字星不会除以 0 |
 
 合约数据（与周期无关，按币种）：
 
@@ -142,8 +165,10 @@ K 线指标（在规则的 `interval` 上按收盘 K 线计算）：
 
 - `on_close`（默认）：只在该周期 K 线**收盘**后评估一次，避免盘中来回抖动产生假信号。
 - `realtime`：每收到一次 1m 推送，就用该周期**未收盘**的 K 线评估。
-  **限制（R3）：`realtime` 规则只能使用 `close`、`change_pct(n)`、`volume` 和合约数据函数**，
-  其它指标（RSI、MACD 等）在未收盘的 K 线上没有意义，配置校验会直接拒绝。
+  **限制（R3）：`realtime` 规则只能使用 `close`、`open`、`high`、`low`、`change_pct(n)`、`amplitude_pct`、
+  `volume`、`volume_ratio(n)` 和合约数据函数**，其它指标（RSI、MACD、影线等）在未收盘的 K 线上没有意义，配置校验会直接拒绝。
+  - 盘中 `high` / `low` / `amplitude_pct` 用的是这根 K 线开盘以来的最高 / 最低价。
+  - 盘中 `volume_ratio(n)` = 这根 K 线**到目前为止**的成交量 ÷ 前 n 根已收盘 K 线的均量。刚开盘时累计量还小，所以这个条件偏严，只有真正放量才成立。
 
 ## 防刷屏
 

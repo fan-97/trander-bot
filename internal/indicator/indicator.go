@@ -148,6 +148,16 @@ var registry = map[string]factory{
 	"lowest":       one("lowest", func(n int) Indicator { return NewLowest(n) }),
 	"close":        zero("close", func() Indicator { return NewClose() }),
 	"volume":       zero("volume", func() Indicator { return NewVolume() }),
+
+	"open":            zero("open", NewOpen),
+	"high":            zero("high", NewHigh),
+	"low":             zero("low", NewLow),
+	"amplitude_pct":   zero("amplitude_pct", func() Indicator { return NewAmplitudePct() }),
+	"upper_wick_pct":  zero("upper_wick_pct", NewUpperWickPct),
+	"lower_wick_pct":  zero("lower_wick_pct", NewLowerWickPct),
+	"wick_body_ratio": zero("wick_body_ratio", NewWickBodyRatio),
+	"upper_wick_atr":  one("upper_wick_atr", func(n int) Indicator { return NewUpperWickATR(n) }),
+	"lower_wick_atr":  one("lower_wick_atr", func(n int) Indicator { return NewLowerWickATR(n) }),
 }
 
 // New builds an indicator by registry name, validating the argument count and

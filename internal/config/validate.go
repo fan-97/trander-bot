@@ -19,7 +19,11 @@ var channelTypes = map[string]bool{
 
 // realtimeFuncs are the kline operands a realtime rule may use: they have a
 // meaningful provisional value on an unclosed bar.
-var realtimeFuncs = map[string]bool{"close": true, "change_pct": true, "volume": true}
+// Wick shapes are excluded: they are only meaningful once the bar has closed.
+var realtimeFuncs = map[string]bool{
+	"close": true, "change_pct": true, "volume": true,
+	"open": true, "high": true, "low": true, "amplitude_pct": true, "volume_ratio": true,
+}
 
 // Validate checks the whole config and returns every problem found, joined.
 func (c *Config) Validate() error {
@@ -78,7 +82,7 @@ func (c *Config) Validate() error {
 		if r.Trigger == TriggerRealtime && r.When != nil {
 			for _, o := range rule.Funcs(r.When) {
 				if !o.IsContract() && !realtimeFuncs[o.Func] {
-					add("rule %q: %s is not supported with trigger realtime (only close, change_pct, volume and contract data)", r.ID, o)
+					add("rule %q: %s is not supported with trigger realtime (only close, open, high, low, change_pct, amplitude_pct, volume, volume_ratio and contract data)", r.ID, o)
 				}
 			}
 		}

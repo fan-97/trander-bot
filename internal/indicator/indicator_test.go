@@ -246,3 +246,81 @@ func TestRing(t *testing.T) {
 		t.Fatal("ring wrong")
 	}
 }
+
+func TestBarShape(t *testing.T) {
+	k0 := market.Kline{Open: 99, High: 101, Low: 98, Close: 100, Closed: true}
+	k1 := market.Kline{Open: 101, High: 106, Low: 95, Close: 102, Closed: true}
+
+	vals := func(name string, args ...float64) (float64, bool) {
+		t.Helper()
+		ind, err := New(name, args)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		feed(ind, k0, k1)
+		return ind.Value()
+	}
+	near := func(name string, got, want float64) {
+		t.Helper()
+		if math.Abs(got-want) > 1e-9 {
+			t.Fatalf("%s=%v want %v", name, got, want)
+		}
+	}
+	for name, want := range map[string]float64{"open": 101, "high": 106, "low": 95} {
+		v, ok := vals(name)
+		if !ok || v != want {
+			t.Fatalf("%s=%v ok=%v", name, v, ok)
+		}
+	}
+	v, ok := vals("amplitude_pct") // (106-95) / prev close 100
+	if !ok {
+		t.Fatal("amplitude_pct not ready")
+	}
+	near("amplitude_pct", v, 11)
+	v, _ = vals("upper_wick_pct") // 106 - max(101,102) over close 102
+	near("upper_wick_pct", v, 4.0/102*100)
+	v, _ = vals("lower_wick_pct") // min(101,102) - 95 over close 102
+	near("lower_wick_pct", v, 6.0/102*100)
+	v, _ = vals("wick_body_ratio") // longer wick 6 / body 1
+	near("wick_body_ratio", v, 6)
+
+	// amplitude needs a previous close
+	a := NewAmplitudePct()
+	a.Update(k1)
+	if _, ok := a.Value(); ok {
+		t.Fatal("amplitude_pct ready without a previous close")
+	}
+
+	// a doji: body is floored at 0.01% of close, never divides by zero
+	d := NewWickBodyRatio()
+	d.Update(market.Kline{Open: 100, High: 101, Low: 100, Close: 100, Closed: true})
+	if v, ok := d.Value(); !ok || math.Abs(v-1/(100*1e-4)) > 1e-9 {
+		t.Fatalf("doji wick_body_ratio=%v ok=%v", v, ok)
+	}
+}
+
+func TestWickATR(t *testing.T) {
+	ks := []market.Kline{
+		{Open: 100, High: 101, Low: 99, Close: 100, Closed: true}, // TR 2
+		{Open: 100, High: 102, Low: 98, Close: 100, Closed: true}, // TR 4 -> ATR(2)=3
+		{Open: 100, High: 101, Low: 94, Close: 100, Closed: true}, // lower wick 6, upper 1
+	}
+	lo, up := NewLowerWickATR(2), NewUpperWickATR(2)
+	feed(lo, ks[:2]...)
+	feed(up, ks[:2]...)
+	if _, ok := lo.Value(); ok {
+		t.Fatal("lower_wick_atr ready before ATR of previous bars exists")
+	}
+	feed(lo, ks[2])
+	feed(up, ks[2])
+	// ATR excludes the current bar, so the spike does not shrink its own ratio.
+	if v, ok := lo.Value(); !ok || math.Abs(v-2) > 1e-9 {
+		t.Fatalf("lower_wick_atr=%v ok=%v", v, ok)
+	}
+	if v, _ := up.Value(); math.Abs(v-1.0/3) > 1e-9 {
+		t.Fatalf("upper_wick_atr=%v", v)
+	}
+	if _, err := New("lower_wick_atr", nil); err == nil {
+		t.Fatal("lower_wick_atr without n accepted")
+	}
+}
