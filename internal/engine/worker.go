@@ -56,6 +56,21 @@ type Worker struct {
 	// staleCheck marks signals from closed bars that arrive long after they
 	// closed (gap fill after an outage) as stale: recorded, never delivered.
 	staleCheck bool
+
+	// history, if set, warms intervals gained on a reload (I3). cold holds
+	// those intervals until their history is applied; while an interval is
+	// cold its first closed bucket started mid-way and is dropped instead of
+	// reaching the indicators. histCh carries fetched history back to Run.
+	history  HistoryFunc
+	cold     map[market.Interval]bool
+	histCh   chan histResult
+	fetching bool
+}
+
+type histResult struct {
+	ivs  []market.Interval
+	hist map[market.Interval][]market.Kline
+	err  error
 }
 
 // minStaleLag is the floor of staleLag.
@@ -80,6 +95,8 @@ func NewWorker(symbol string, cfg *config.Config, gate *signal.Gate, out chan<- 
 		bars:       map[market.Interval][]market.Kline{},
 		lastClosed: map[market.Interval]time.Time{},
 		staleCheck: true,
+		cold:       map[market.Interval]bool{},
+		histCh:     make(chan histResult, 1),
 	}
 	w.setConfig(cfg)
 	return w
@@ -121,16 +138,19 @@ func (w *Worker) Warmup(history map[market.Interval][]market.Kline) {
 	if n := len(ones); n > 0 {
 		w.lastPrice = ones[n-1].Close
 	}
-	w.primeGate()
+	w.primeGate(nil)
 }
 
-// primeGate evaluates every rule once on the warmed-up state and seeds the
-// gate with the result without emitting, so conditions already true before
-// a (re)start are not announced again (R23). Rules whose data is not ready
-// evaluate Unknown and are left unprimed.
-func (w *Worker) primeGate() {
+// primeGate evaluates the rules of ivs (nil: every rule) once on the
+// warmed-up state and seeds the gate with the result without emitting, so
+// conditions already true before a (re)start are not announced again (R23).
+// Rules whose data is not ready evaluate Unknown and are left unprimed.
+func (w *Worker) primeGate(ivs []market.Interval) {
 	for _, r := range w.rules {
 		if r.When == nil || w.aggs[r.Interval] == nil {
+			continue
+		}
+		if ivs != nil && !slices.Contains(ivs, r.Interval) {
 			continue
 		}
 		if _, ok := w.lastClosed[r.Interval]; !ok {
@@ -138,6 +158,76 @@ func (w *Worker) primeGate() {
 		}
 		w.gate.Prime(r.ID, w.symbol, rule.Eval(r.When, w.values(r.Interval, nil)))
 	}
+}
+
+// fetchCold fetches history for the intervals gained on a reload, off the
+// event loop; Run applies the result. At most one fetch is in flight.
+func (w *Worker) fetchCold(ctx context.Context) {
+	if w.history == nil || w.fetching || len(w.cold) == 0 {
+		return
+	}
+	ivs := make([]market.Interval, 0, len(w.cold))
+	for iv := range w.cold {
+		ivs = append(ivs, iv)
+	}
+	slices.SortFunc(ivs, func(a, b market.Interval) int { return cmp.Compare(a.Duration(), b.Duration()) })
+	w.fetching = true
+	go func() {
+		hist, err := w.history(ctx, w.symbol)
+		select {
+		case w.histCh <- histResult{ivs: ivs, hist: hist, err: err}:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// applyHistory warms the reloaded intervals in h like Warmup does. An
+// interval stays cold (its first, partial bucket is dropped) when the fetch
+// failed or no 1m bars could complete its in-progress bucket.
+func (w *Worker) applyHistory(ctx context.Context, h histResult) {
+	w.fetching = false
+	if h.err != nil {
+		// The history func reports the failure itself (预热失败 alert).
+		w.log.Warn("engine: history for reloaded intervals failed; their first bucket is dropped", "intervals", h.ivs, "err", h.err)
+		return
+	}
+	ones := sortedClosed(h.hist[market.I1m])
+	var warmed []market.Interval
+	for _, iv := range h.ivs {
+		if !w.cold[iv] || w.aggs[iv] == nil {
+			continue
+		}
+		delete(w.cold, iv)
+		for _, k := range sortedClosed(h.hist[iv]) {
+			if k.Interval == iv {
+				_ = w.onBar(ctx, k, false)
+			}
+		}
+		last, ok := w.lastClosed[iv]
+		if !ok {
+			w.cold[iv] = true
+			continue
+		}
+		filled := false
+		next := last.Add(iv.Duration())
+		for _, k := range ones {
+			if k.Interval != market.I1m || k.OpenTime.Before(next) {
+				continue
+			}
+			filled = true
+			for _, b := range w.aggs[iv].Add(k) {
+				_ = w.onBar(ctx, b, false)
+			}
+		}
+		if !filled && iv != market.I1m {
+			w.cold[iv] = true
+		}
+		warmed = append(warmed, iv)
+	}
+	if len(warmed) > 0 {
+		w.primeGate(warmed)
+	}
+	w.fetchCold(ctx) // intervals gained while this fetch was in flight
 }
 
 func sortedClosed(ks []market.Kline) []market.Kline {
@@ -166,7 +256,10 @@ func (w *Worker) Run(ctx context.Context, in <-chan market.Event, cfgs <-chan *c
 			}
 			if c != nil {
 				w.reconfigure(c)
+				w.fetchCold(ctx)
 			}
+		case h := <-w.histCh:
+			w.applyHistory(ctx, h)
 		case ev, ok := <-in:
 			if !ok {
 				return nil
@@ -240,6 +333,14 @@ func (w *Worker) onBar(ctx context.Context, k market.Kline, eval bool) error {
 				}
 			}
 		}
+		return nil
+	}
+	if w.cold[iv] {
+		// Gained on a reload without (enough) history: this bucket started
+		// mid-way, so its volume/high/low are partial. Skip it (I3).
+		delete(w.cold, iv)
+		w.lastClosed[iv] = k.OpenTime
+		w.log.Info("engine: dropped the first, partial bucket of a reloaded interval", "interval", iv)
 		return nil
 	}
 	for _, ind := range w.ivInds[iv] {
@@ -382,9 +483,17 @@ func (w *Worker) setConfig(cfg *config.Config) {
 			delete(w.lastClosed, iv)
 		}
 	}
+	for iv := range w.cold {
+		if !set[iv] {
+			delete(w.cold, iv)
+		}
+	}
 	for _, iv := range targets {
 		if w.aggs[iv] == nil {
 			w.aggs[iv] = market.NewAggregator(w.symbol, []market.Interval{iv})
+			if w.started {
+				w.cold[iv] = true // gained on a reload: no history yet (I3)
+			}
 		}
 	}
 	w.targets = targets

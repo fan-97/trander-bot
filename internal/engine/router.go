@@ -152,6 +152,7 @@ func (r *Router) start(ctx context.Context, symbol string, cfg *config.Config) {
 	}
 	w := NewWorker(symbol, cfg, r.gate, r.out, r.clk)
 	w.log = r.log().With("symbol", symbol)
+	w.history = r.history // warms intervals gained on a later reload
 	go func() {
 		defer close(h.done)
 		// Warmup runs here, not in Run's loop: events buffer in h.in meanwhile.

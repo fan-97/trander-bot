@@ -154,6 +154,66 @@ func TestWorker_WarmupDoesNotEmit(t *testing.T) {
 	}
 }
 
+// I3: an interval gained on a reload with no history drops its first,
+// partial bucket instead of feeding it to the indicators.
+func TestWorker_ReloadedIntervalDropsPartialFirstBucket(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: a, interval: 5m, when: {all: ["close > 1"]}, channels: [tg]}`))
+	h.w.started = true
+	h.w.reconfigure(parseCfg(t,
+		`{id: a, interval: 5m, when: {all: ["close > 1"]}, channels: [tg]}`,
+		`{id: b, interval: 15m, when: {all: ["volume_ratio(2) > 1"]}, channels: [tg]}`))
+	// Start 7 minutes into a 15m bucket: minutes 7..14 close a partial bucket.
+	for m := 7; m < 15; m++ {
+		h.handle(t, k1(sym, m, 100, 1, true))
+	}
+	if n := len(h.w.bars[market.I15m]); n != 0 {
+		t.Fatalf("partial bucket kept: %d bars", n)
+	}
+	for m := 15; m < 30; m++ {
+		h.handle(t, k1(sym, m, 100, 1, true))
+	}
+	if bs := h.w.bars[market.I15m]; len(bs) != 1 || bs[0].Volume != 15 {
+		t.Fatalf("second bucket = %+v, want one full bucket (volume 15)", bs)
+	}
+}
+
+// I3: with a history func, an interval gained on a reload is warmed from
+// history (including the 1m bars of its in-progress bucket).
+func TestWorker_ReloadedIntervalWarmsFromHistory(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: a, interval: 5m, when: {all: ["close > 1"]}, channels: [tg]}`))
+	h.w.started = true
+	var q []market.Kline
+	for i := 0; i < 20; i++ {
+		q = append(q, market.Kline{Symbol: sym, Interval: market.I15m, OpenTime: t0.Add(time.Duration(i) * 15 * time.Minute),
+			Open: 100, High: 100, Low: 100, Close: 100, Volume: 15, Closed: true})
+	}
+	var ones []market.Kline
+	for m := 300; m < 307; m++ { // first 7 minutes of bucket 20
+		ones = append(ones, k1(sym, m, 100, 1, true).Kline)
+	}
+	h.w.history = func(context.Context, string) (map[market.Interval][]market.Kline, error) {
+		return map[market.Interval][]market.Kline{market.I15m: q, market.I1m: ones}, nil
+	}
+	h.w.reconfigure(parseCfg(t,
+		`{id: a, interval: 5m, when: {all: ["close > 1"]}, channels: [tg]}`,
+		`{id: b, interval: 15m, when: {all: ["volume_ratio(2) > 1"]}, channels: [tg]}`))
+	h.w.fetchCold(context.Background())
+	h.w.applyHistory(context.Background(), <-h.w.histCh)
+	if h.w.cold[market.I15m] {
+		t.Fatal("interval still cold after history")
+	}
+	if n := len(h.w.bars[market.I15m]); n != 20 {
+		t.Fatalf("warmed bars = %d, want 20", n)
+	}
+	for m := 307; m < 315; m++ {
+		h.handle(t, k1(sym, m, 100, 1, true))
+	}
+	bs := h.w.bars[market.I15m]
+	if len(bs) != 21 || bs[20].Volume != 15 {
+		t.Fatalf("live bucket after history = %+v, want a complete bucket (volume 15)", bs[len(bs)-1])
+	}
+}
+
 // I2: a closed bar that arrives long after it closed (a gap fill after an
 // outage) still updates indicators, but its signal is recorded as stale and
 // never delivered; the same bar arriving on time fires normally.
