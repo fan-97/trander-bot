@@ -2,6 +2,7 @@ package signal
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -499,5 +500,36 @@ func TestBatcher_HotReloadReArmsEarlierTimer(t *testing.T) {
 	h.clk.Advance(7 * time.Second) // t=10s
 	if b := h.batch(); b.Channel != "tg" || !eqStrings(ids(b.Signals), []string{"a"}) {
 		t.Fatalf("batch = %s %v, want tg [a]", b.Channel, ids(b.Signals))
+	}
+}
+
+// Repeats of one (rule, symbol) inside a window go out as a single line with
+// a ×N marker (the latest occurrence); every occurrence is still recorded.
+func TestBatcher_CollapsesRepeatsInBatch(t *testing.T) {
+	h := newHarness(t, noonUTC, baseCfg())
+	for i, p := range []float64{100, 101, 102} {
+		s := sig("pump", config.LevelWarn, "tg")
+		s.Symbol, s.Price, s.Detail = "BTCUSDT", p, "close=x"
+		h.send(s)
+		if i == 0 {
+			o := sig("pump", config.LevelWarn, "tg")
+			o.Symbol, o.Detail = "ETHUSDT", "close=y"
+			h.send(o)
+		}
+		h.clk.Advance(2 * time.Second)
+	}
+	h.clk.Advance(5 * time.Second)
+	b := h.batch()
+	if len(b.Signals) != 2 {
+		t.Fatalf("batch has %d signals, want 2: %+v", len(b.Signals), b.Signals)
+	}
+	if btc := b.Signals[0]; btc.Symbol != "BTCUSDT" || btc.Price != 102 || !strings.HasSuffix(btc.Detail, "(×3)") {
+		t.Fatalf("collapsed BTC = %+v", btc)
+	}
+	if eth := b.Signals[1]; eth.Symbol != "ETHUSDT" || strings.Contains(eth.Detail, "×") {
+		t.Fatalf("ETH = %+v", eth)
+	}
+	for i := 0; i < 4; i++ {
+		h.record()
 	}
 }

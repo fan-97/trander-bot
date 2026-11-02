@@ -176,8 +176,10 @@ func (w *Worker) handle(ctx context.Context, ev market.Event) error {
 			price = m
 		}
 	}
+	// Only realtime contract-only rules react to contract events; on_close
+	// ones wait for their interval's close like every other rule (R22).
 	for i, r := range w.rules {
-		if m := w.meta[i]; m.contractOnly && m.srcs&src != 0 {
+		if m := w.meta[i]; m.contractOnly && m.srcs&src != 0 && r.Trigger == config.TriggerRealtime {
 			if err := w.evaluate(ctx, r, w.values(r.Interval, nil), price); err != nil {
 				return err
 			}

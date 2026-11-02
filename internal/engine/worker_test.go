@@ -242,8 +242,29 @@ func TestWorker_FundingRule(t *testing.T) {
 	}
 }
 
-func TestWorker_ContractOnlyRuleOnEvent(t *testing.T) {
-	h := newHarness(t, parseCfg(t, `{id: neg_funding, interval: 1h, when: {all: ["funding_rate < -0.0005"]}, channels: [tg]}`))
+// R22: an on_close contract-only rule waits for its interval's close, so a
+// funding rate hovering around the threshold cannot fire on every markPrice.
+func TestWorker_ContractOnlyOnCloseWaitsForClose(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: neg_funding, interval: 1m, when: {all: ["funding_rate < -0.0005"]}, channels: [tg]}`))
+	h.handle(t, k1(sym, 0, 123, 1, false))
+	for i := 0; i < 30; i++ {
+		fr := -0.0007
+		if i%2 == 1 {
+			fr = -0.0001
+		}
+		if got := h.handle(t, market.MarkPriceEvent{Symbol: sym, Time: h.clk.Now(), MarkPrice: 124, FundingRate: fr}); len(got) != 0 {
+			t.Fatalf("on_close rule fired on a contract event: %v", ids(got))
+		}
+	}
+	h.handle(t, market.MarkPriceEvent{Symbol: sym, Time: h.clk.Now(), MarkPrice: 124, FundingRate: -0.0007})
+	got := h.handle(t, k1(sym, 0, 123, 1, true))
+	if len(got) != 1 || got[0].RuleID != "neg_funding" {
+		t.Fatalf("signals on close=%v", ids(got))
+	}
+}
+
+func TestWorker_ContractOnlyRealtimeRuleOnEvent(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: neg_funding, interval: 1h, trigger: realtime, when: {all: ["funding_rate < -0.0005"]}, channels: [tg]}`))
 	h.handle(t, k1(sym, 0, 123, 1, false))
 	got := h.handle(t, market.MarkPriceEvent{Symbol: sym, Time: h.clk.Now(), MarkPrice: 124, FundingRate: -0.0007})
 	if len(got) != 1 || got[0].RuleID != "neg_funding" || got[0].Price != 123 || got[0].Interval != market.I1h {

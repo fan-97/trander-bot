@@ -154,6 +154,8 @@ func (r *rawConfig) build() (*Config, error) {
 				errs = append(errs, fmt.Errorf("rules[%d] %q: invalid cooldown %q: %w", i, rr.ID, rr.Cooldown, err))
 			}
 			r2.Cooldown = d
+		} else {
+			r2.Cooldown = defaultCooldown(r2.Interval)
 		}
 		if w := &rr.When; w.IsZero() || w.Tag == "!!null" || (w.Kind == yaml.ScalarNode && w.Value == "") {
 			errs = append(errs, fmt.Errorf("rule %q: missing when", rr.ID))
@@ -209,6 +211,16 @@ func (r *rawConfig) build() (*Config, error) {
 	}
 
 	return c, errors.Join(errs...)
+}
+
+// minDefaultCooldown is the floor for a rule that omits cooldown, so a
+// condition hovering around its threshold cannot re-fire on every crossing.
+const minDefaultCooldown = 15 * time.Minute
+
+// defaultCooldown is max(interval, 15m) (R21). Set cooldown: 0s explicitly
+// to disable it.
+func defaultCooldown(iv market.Interval) time.Duration {
+	return max(iv.Duration(), minDefaultCooldown)
 }
 
 // RulesFor returns the rules that apply to symbol.

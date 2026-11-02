@@ -41,7 +41,7 @@ cp configs/config.example.yaml configs/config.yaml
 | `rules[].interval` | 是 | – | 规则在哪个周期上评估。 |
 | `rules[].trigger` | 否 | `on_close` | `on_close`：K 线收盘后评估；`realtime`：每次 1m 推送都用未收盘的 K 线评估（见下面的限制）。 |
 | `rules[].when` | 是 | – | 条件树，见“规则语法”。 |
-| `rules[].cooldown` | 否 | 无 | 同一规则 + 同一币种两次推送的最小间隔，如 `30m`、`1h`。 |
+| `rules[].cooldown` | 否 | max(周期, 15m) | 同一规则 + 同一币种两次推送的最小间隔，如 `30m`、`1h`；`0s` 表示不冷却。 |
 | `rules[].channels` | 是 | – | 推送到哪些渠道（`channels` 里的名字）。 |
 | `rules[].level` | 否 | `warn` | `info` / `warn` / `critical`。`critical` 不受限速和免打扰限制。 |
 | `channels.<名字>.type` | 是 | – | `telegram` `discord` `webhook` `email` `wecom` `dingtalk` `feishu`。 |
@@ -135,7 +135,8 @@ K 线指标（在规则的 `interval` 上按收盘 K 线计算）：
 | `top_long_short_ratio` | 0 | 大户多空持仓比（5m） |
 | `liq_volume(m)` | 1 | 最近 m 分钟爆仓名义金额（价格 × 数量，USDT） |
 
-只引用合约数据的规则会在对应数据到达时评估（而不是等 K 线收盘）。
+只引用合约数据的规则：`trigger: on_close`（默认）时同样只在该规则周期的 K 线收盘时评估；
+只有写成 `trigger: realtime` 才会在每次对应数据到达时评估（资金费率每秒一次）。
 
 ### trigger：on_close 与 realtime
 
@@ -149,7 +150,9 @@ K 线指标（在规则的 `interval` 上按收盘 K 线计算）：
 1. **边沿触发**：条件从“不满足”变成“满足”才触发一次，持续满足不会重复推送。
 2. **收盘确认**：默认 `on_close`。
 3. **冷却**：按“规则 + 币种”计算，冷却期内再次出现的边沿不推送，但会落库（`suppressed = cooldown`）。
-4. **合并推送**：每个渠道一个合并窗口（`notify.merge_window`），窗口内的信号合成一条消息。
+   规则不写 `cooldown` 时默认为 **max(规则周期, 15m)**；确实想要无冷却请显式写 `cooldown: 0s`。
+4. **合并推送**：每个渠道一个合并窗口（`notify.merge_window`），窗口内的信号合成一条消息；
+   同一窗口里“同一规则 + 同一币种”的多次信号合并成一行（取最新值，结尾标 `(×N)`）。
 5. **限速 + 免打扰**：每个渠道每分钟最多 `rate_per_minute` 条信号，超出的落库为 `suppressed = rate`；
    免打扰时段内低于 `quiet_min_level` 的信号落库为 `suppressed = quiet`。`critical` 级别不受这两条限制。
 6. **被压下的信号也落库**：所有信号（推送的和被压下的）都写入 `signals` 表，方便复盘。

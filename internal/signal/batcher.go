@@ -2,6 +2,7 @@ package signal
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -216,7 +217,34 @@ func (b *Batcher) decide(w *window) Batch {
 			b.record(r)
 		}
 	}
+	batch.Signals = collapse(batch.Signals)
 	return batch
+}
+
+// collapse merges repeats of one (rule, symbol) into a single line, keeping
+// the first one's position and the latest one's values, and marks the count
+// as "(×N)" so the user sees one line instead of N.
+func collapse(ss []Signal) []Signal {
+	type key struct{ rule, symbol string }
+	idx := map[key]int{}
+	count := map[key]int{}
+	var out []Signal
+	for _, s := range ss {
+		k := key{s.RuleID, s.Symbol}
+		count[k]++
+		if i, ok := idx[k]; ok {
+			out[i] = s
+			continue
+		}
+		idx[k] = len(out)
+		out = append(out, s)
+	}
+	for k, i := range idx {
+		if n := count[k]; n > 1 {
+			out[i].Detail = fmt.Sprintf("%s (×%d)", out[i].Detail, n)
+		}
+	}
+	return out
 }
 
 // take consumes one token from ch's bucket; rate <= 0 means unlimited.

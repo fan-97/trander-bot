@@ -162,3 +162,22 @@ func TestValidate_RealtimeOperands(t *testing.T) {
 		t.Fatalf("allowed operands rejected: %v", err)
 	}
 }
+
+// R21: an omitted cooldown defaults to max(interval, 15m); an explicit 0s
+// still means "no cooldown".
+func TestBuild_DefaultCooldown(t *testing.T) {
+	head := "symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n"
+	c, err := Parse([]byte(head +
+		"  - {id: m1, interval: 1m, when: {all: [\"close > 1\"]}, channels: [tg]}\n" +
+		"  - {id: h4, interval: 4h, when: {all: [\"close > 1\"]}, channels: [tg]}\n" +
+		"  - {id: zero, interval: 1m, cooldown: 0s, when: {all: [\"close > 1\"]}, channels: [tg]}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]time.Duration{"m1": 15 * time.Minute, "h4": 4 * time.Hour, "zero": 0}
+	for _, r := range c.Rules {
+		if r.Cooldown != want[r.ID] {
+			t.Errorf("rule %s cooldown=%v want %v", r.ID, r.Cooldown, want[r.ID])
+		}
+	}
+}
