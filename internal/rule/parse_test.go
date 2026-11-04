@@ -6,12 +6,16 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"trader-bot/internal/market"
 )
 
 func f(v float64) *float64 { return &v }
 
 func fn(name string, args ...float64) Operand { return Operand{Func: name, Args: args} }
 func cn(v float64) Operand                    { return Operand{Const: f(v)} }
+
+func at(o Operand, iv market.Interval) Operand { o.Interval = iv; return o }
 
 func TestParseLeaf(t *testing.T) {
 	tests := []struct {
@@ -31,6 +35,10 @@ func TestParseLeaf(t *testing.T) {
 		{"oi_change_pct(4) == 0", Leaf{fn("oi_change_pct", 4), OpEQ, cn(0)}},
 		{"liq_volume(15) > 1000000", Leaf{fn("liq_volume", 15), OpGT, cn(1000000)}},
 		{"macd(12,26,9) > 0", Leaf{fn("macd", 12, 26, 9), OpGT, cn(0)}},
+		{"ema(20)@4h > ema(50)@4h", Leaf{at(fn("ema", 20), "4h"), OpGT, at(fn("ema", 50), "4h")}},
+		{"low <= ema(20)@4h", Leaf{fn("low"), OpLTE, at(fn("ema", 20), "4h")}},
+		{"close@1d > 0", Leaf{at(fn("close"), "1d"), OpGT, cn(0)}},
+		{"cross_up(close, ema(20)@4h)", Leaf{fn("close"), OpCrossUp, at(fn("ema", 20), "4h")}},
 	}
 	for _, tt := range tests {
 		got, err := ParseLeaf(tt.in)
@@ -50,6 +58,7 @@ func TestParseLeaf_Errors(t *testing.T) {
 		"cross_up(ema(12))", "cross_up ema(12), ema(26)", "rsi(14) 30", "rsi(14) < 30 extra",
 		"rsi(0) < 30", "rsi(-1) < 30", "rsi(1.5) < 30", "funding_rate(1) < 0", "oi_change_pct > 1",
 		"liq_volume(0) > 1", "", "rsi(14) = 30", "rsi(14 < 30", "rsi(x) < 30", "1e > 3",
+		"ema(20)@2h > 1", "ema(20)@ > 1", "close > 3@4h", "funding_rate@4h < 0", "ema(20)@4h@1h > 1",
 	} {
 		_, err := ParseLeaf(in)
 		if err == nil {
@@ -177,5 +186,44 @@ all:
 	want := []string{"rsi(14)", "ema(12)", "ema(26)", "close", "funding_rate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestOperandIntervalString(t *testing.T) {
+	l, err := ParseLeaf("ema(20)@4h > close@1h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := l.Left.String(); got != "ema(20)@4h" {
+		t.Errorf("left %q", got)
+	}
+	if got := l.Right.String(); got != "close@1h" {
+		t.Errorf("right %q", got)
+	}
+	if got := l.Left.Local().String(); got != "ema(20)" {
+		t.Errorf("local %q", got)
+	}
+	if l.Left.On("1h") != "4h" || fn("close").On("1h") != "1h" {
+		t.Error("On")
+	}
+}
+
+func TestIntervals(t *testing.T) {
+	n, err := Parse(mustYAML(t, `
+all:
+  - ema(20)@4h > ema(50)@4h
+  - low <= ema(20)@4h
+  - close@1d > ema(20)
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Intervals(n)
+	if !reflect.DeepEqual(got, []market.Interval{"4h", "1d"}) {
+		t.Errorf("got %v", got)
+	}
+	// ema(20) and ema(20)@4h are distinct operands.
+	if fs := Funcs(n); len(fs) != 5 {
+		t.Errorf("funcs %v", fs)
 	}
 }

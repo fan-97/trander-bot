@@ -35,7 +35,7 @@ cp configs/config.example.yaml configs/config.yaml
 | 键 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `symbols` | 是 | – | 监控的币种池，如 `[BTCUSDT, ETHUSDT]`。启动时会和交易所的 U 本位永续列表核对，不存在或不在交易的币会被忽略并发一条系统告警。 |
-| `intervals` | 否 | 规则用到的周期 | 需要聚合/预热的周期：`1m` `5m` `15m` `1h` `4h` `1d`。写了的话，每条规则的 `interval` 必须在列表里。 |
+| `intervals` | 否 | 规则用到的周期 | 需要聚合/预热的周期：`1m` `5m` `15m` `1h` `4h` `1d`。写了的话，每条规则的 `interval`、`@` 引用的周期（含 `setup` 里的）和 `targets.interval` 都必须在列表里。不写时自动包含这些周期，启动时都会通过 REST 预热 500 根。 |
 | `rules[].id` | 是 | – | 规则名，唯一，会出现在通知里。 |
 | `rules[].symbols` | 否 | `all` | `all`（整个币种池）或币种列表（必须在 `symbols` 里）。 |
 | `rules[].interval` | 是 | – | 规则在哪个周期上评估。 |
@@ -44,6 +44,8 @@ cp configs/config.example.yaml configs/config.yaml
 | `rules[].cooldown` | 否 | max(周期, 15m) | 同一规则 + 同一币种两次推送的最小间隔，如 `30m`、`1h`；`0s` 表示不冷却。 |
 | `rules[].channels` | 是 | – | 推送到哪些渠道（`channels` 里的名字）。 |
 | `rules[].level` | 否 | `warn` | `info` / `warn` / `critical`。`critical` 不受限速和免打扰限制。 |
+| `rules[].setup` | 否 | – | 两阶段规则的前置条件，见下面“两阶段规则 `setup`”。 |
+| `rules[].targets` | 否 | – | 基于 ATR 的止损 / 止盈参考价，只显示在通知里，不影响是否触发。见下面“ATR 止损止盈参考”。 |
 | `channels.<名字>.type` | 是 | – | `telegram` `discord` `webhook` `email` `wecom` `dingtalk` `feishu`。 |
 | `channels.<名字>.fallback` | 否 | – | 重试 3 次仍失败时转发到的备用渠道名（只转发一次；系统告警不转发）。 |
 | `channels.<名字>.params` | 视类型 | – | 见“通知渠道参数”。 |
@@ -67,7 +69,7 @@ cp configs/config.example.yaml configs/config.yaml
 - 叶子字符串：`<操作数> <比较符> <操作数>`，比较符为 `>` `>=` `<` `<=` `==`；
   或者交叉：`cross_up(a, b)`（a 上穿 b，金叉）、`cross_down(a, b)`（a 下穿 b，死叉）。
 
-操作数是函数调用或数字常量（可为负数、小数）。例子：
+操作数是函数调用或数字常量（可为负数、小数）。K 线函数后面可以加 `@周期` 读取另一个周期，见“跨周期引用”。例子：
 
 ```yaml
 rules:
@@ -119,11 +121,94 @@ rules:
     channels: [telegram]
 ```
 
+### 跨周期引用 `@周期`
+
+在 K 线函数后面加 `@1m` `@5m` `@15m` `@1h` `@4h` `@1d`，就读取那个周期的值，例如 `ema(20)@4h`、`close@1d`。
+不加后缀时用规则自己的 `interval`。
+
+- 读的是该周期**最近一根已收盘** K 线上的值，不会用未收盘的高周期 K 线（不会重绘、不会偷看未来）。
+  1h 和 4h 在同一分钟收盘时（如 08:00），先更新 4h，再评估 1h 规则，所以 1h 规则读到的是刚收盘的那根 4h。
+- `realtime` 规则里的 `@` 操作数同样读已收盘的值，因此可以用任何指标（如 `ema(20)@1h`），不受 R3 限制。
+- 合约数据函数与周期无关，不能加 `@`。
+
+例子：4H 趋势 + 1H 回踩 4H EMA20：
+
+```yaml
+  - id: trend_pullback_ema_long
+    interval: 1h
+    when:
+      all:
+        - ema(20)@4h > ema(50)@4h    # 4H 多头排列
+        - close@4h > ema(50)@4h      # 4H 收盘在 EMA50 上方
+        - low <= ema(20)@4h          # 1H 最低价回踩到 4H EMA20
+        - close > ema(20)@4h         # 1H 收回 EMA20 上方
+    cooldown: 4h
+    targets: {side: long, atr: 14, stop: 1.5, take: [2, 3]}
+    channels: [telegram]
+```
+
+### 两阶段规则 `setup`：先满足前置条件，再等触发
+
+有些信号要求严格的先后顺序，比如“4H 上涨中 1H 先回踩确认，之后 15m 再放量突破”。给规则加 `setup` 即可：
+
+```yaml
+  - id: trend_pullback_breakout_long
+    interval: 15m
+    trigger: realtime                        # 盘中突破就发，不等 15m 收盘
+    setup:                                   # 第一阶段：4H 上涨 + 1H 回踩确认
+      when:
+        all:
+          - ema(20)@4h > ema(50)@4h
+          - close@4h > ema(50)@4h
+          - low@1h <= ema(20)@4h             # 1H 回踩到 4H EMA20
+          - close@1h > ema(20)@4h            # 并收回 EMA20 上方
+      invalidate: close@1h < ema(50)@4h      # 可选：1H 跌破 4H EMA50 就作废
+      within: 8h                             # 回踩确认后 8 小时内有效
+    when:                                    # 第二阶段：15m 放量突破
+      all:
+        - ema(20)@4h > ema(50)@4h            # 突破时趋势仍在
+        - close > highest(20)                # 盘中突破前 20 根 15m 高点
+        - volume_ratio(20) > 2               # 这根 15m 到目前的量已达均量 2 倍
+    cooldown: 4h
+    targets: {side: long, atr: 14, stop: 1.5, take: [2, 3]}
+    channels: [telegram]
+```
+
+规则是这样走的：
+
+1. `setup.when` 从不成立变成成立时，规则进入“待触发”。之后只要 `setup.when` 还成立，有效期就一直往后延；
+   它不再成立后再过 `within`，待触发就失效。
+2. 待触发期间，`when` **从不成立变成成立**才推送。突破如果在回踩确认之前就已经发生（价格一直在高点上方），不算。
+3. 一次待触发最多推一次。推送后，要等 `setup.when` 先不成立、再成立一次，才会重新进入待触发。
+4. `invalidate` 成立时，待触发立即作废。
+5. 推送内容会附上前置条件进入待触发时的取值，例如
+   `close=64120 > highest(20)=64000; volume_ratio(20)=2.4 > 2 | 前置: ema(20)@4h=63500 > ema(50)@4h=62000; ...`。
+6. 启动或重启时，如果 `setup.when` 已经成立，从启动那一刻起进入待触发；已经成立的 `when` 不算新的突破。
+   待触发状态只保存在内存里，修改这条规则的 `when`/`setup` 并热加载后会清空。
+
+`setup` 的配置项：`when`（必填，条件树）、`within`（必填，时长，如 `8h`）、`invalidate`（可选，条件树）。
+`realtime` 规则的操作数限制同样适用于 `setup` 里的条件（`@周期` 操作数不受限）。
+
+### ATR 止损止盈参考 `targets`
+
+```yaml
+    targets:
+      side: long      # long | short（必填）
+      atr: 14         # ATR 周期数，默认 14
+      interval: 1h    # 在哪个周期上算 ATR，默认规则自己的 interval
+      stop: 1.5       # 止损 = 价格 ∓ 1.5×ATR；不写或 0 表示不显示止损
+      take: [2, 3]    # 止盈 = 价格 ± k×ATR，可写多档
+```
+
+价格是信号价格（触发 K 线的收盘价，`realtime` 为当前价），ATR 是该周期最近一根已收盘 K 线的值。
+通知末尾会附加类似 `ATR(14)@1h=412.35 止损 59381.48 止盈 60824.69 / 61237.04`。ATR 还没预热好时不显示这一段，信号照常推送。
+这些价格只是参考，不会下单，也不会写入数据库的 `signals.detail`。
+
 求值是三值逻辑：数据不足（例如预热不够、合约数据还没到）时叶子为“未知”，未知不会触发，也不会重置边沿状态。
 
 ### 可用函数
 
-K 线指标（在规则的 `interval` 上按收盘 K 线计算）：
+K 线指标（在规则的 `interval` 上按收盘 K 线计算；加 `@周期` 则在那个周期上计算）：
 
 | 函数 | 参数个数 | 含义 |
 |---|---|---|
@@ -167,8 +252,10 @@ K 线指标（在规则的 `interval` 上按收盘 K 线计算）：
 - `on_close`（默认）：只在该周期 K 线**收盘**后评估一次，避免盘中来回抖动产生假信号。
 - `realtime`：每收到一次 1m 推送，就用该周期**未收盘**的 K 线评估。
   **限制（R3）：`realtime` 规则只能使用 `close`、`open`、`high`、`low`、`change_pct(n)`、`amplitude_pct`、
-  `volume`、`volume_ratio(n)` 和合约数据函数**，其它指标（RSI、MACD、影线等）在未收盘的 K 线上没有意义，配置校验会直接拒绝。
+  `volume`、`volume_ratio(n)`、`highest(n)`、`lowest(n)`、`@周期` 操作数和合约数据函数**，其它指标（RSI、MACD、影线等）在未收盘的 K 线上没有意义，配置校验会直接拒绝。
   - 盘中 `high` / `low` / `amplitude_pct` 用的是这根 K 线开盘以来的最高 / 最低价。
+  - 盘中 `highest(n)` / `lowest(n)` = 前 n 根**已收盘** K 线的最高 / 最低价，不含正在走的这根，整根 K 线期间不变；
+    所以 `close > highest(20)` 就是“当前价突破前 20 根高点”的盘中突破。
   - 盘中 `volume_ratio(n)` = 这根 K 线**到目前为止**的成交量 ÷ 前 n 根已收盘 K 线的均量。刚开盘时累计量还小，所以这个条件偏严，只有真正放量才成立。
 
 ## 防刷屏

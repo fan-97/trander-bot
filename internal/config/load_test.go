@@ -17,7 +17,7 @@ func TestLoad_Example(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Rules) != 2 {
+	if len(c.Rules) != 5 {
 		t.Fatalf("rules=%d", len(c.Rules))
 	}
 	if c.Rules[0].Cooldown != 30*time.Minute {
@@ -35,7 +35,7 @@ func TestLoad_Example(t *testing.T) {
 	if got := c.Channels["telegram"].Params["token"]; got != "tok" {
 		t.Errorf("env expand: %q", got)
 	}
-	if len(c.Intervals) != 2 || c.Intervals[0] != market.I5m {
+	if len(c.Intervals) != 4 || c.Intervals[0] != market.I5m || c.Intervals[2] != market.I4h || c.Intervals[3] != market.I15m {
 		t.Errorf("intervals=%v", c.Intervals)
 	}
 	if c.Binance.RESTURL != "https://fapi.binance.com" || c.Binance.WSURL != "wss://fstream.binance.com/market" {
@@ -226,5 +226,103 @@ func TestNotifyTZ(t *testing.T) {
 	}
 	if _, err := Parse([]byte(head + "notify: {tz: Mars/Base}\n")); err == nil || !strings.Contains(err.Error(), "notify.tz") {
 		t.Fatalf("bad tz: %v", err)
+	}
+}
+
+func TestCrossIntervals(t *testing.T) {
+	head := "symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\n"
+	rules := `rules:
+  - id: pb
+    interval: 1h
+    when: {all: ["ema(20)@4h > ema(50)@4h", "low <= ema(20)@4h"]}
+    targets: {side: long, interval: 15m, stop: 1.5, take: [2, 3]}
+    channels: [tg]
+`
+	c, err := Parse([]byte(head + rules))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []market.Interval{market.I1h, market.I4h, market.I15m}
+	if len(c.Intervals) != 3 || c.Intervals[0] != want[0] || c.Intervals[1] != want[1] || c.Intervals[2] != want[2] {
+		t.Errorf("derived intervals=%v want %v", c.Intervals, want)
+	}
+	tg := c.Rules[0].Targets
+	if tg == nil || tg.ATR != 14 || tg.Side != SideLong || tg.Interval != market.I15m || tg.Stop != 1.5 || len(tg.Take) != 2 {
+		t.Errorf("targets=%+v", tg)
+	}
+
+	_, err = Parse([]byte(head + "intervals: [1h]\n" + rules))
+	if err == nil || !strings.Contains(err.Error(), `interval "4h" (referenced with @) not in intervals list`) ||
+		!strings.Contains(err.Error(), `targets.interval "15m" not in intervals list`) {
+		t.Fatalf("explicit intervals: %v", err)
+	}
+
+	// An @ operand reads a closed bar, so realtime rules may use any indicator.
+	if _, err := Parse([]byte(head + `rules: [{id: a, interval: 5m, trigger: realtime, when: {all: ["close > ema(20)@1h"]}, channels: [tg]}]`)); err != nil {
+		t.Errorf("realtime with @: %v", err)
+	}
+}
+
+func TestTargetsDefaultsAndErrors(t *testing.T) {
+	head := "symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n"
+	c, err := Parse([]byte(head + `  - {id: a, interval: 1h, when: "close > 1", targets: {side: short, take: [2]}, channels: [tg]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tg := c.Rules[0].Targets; tg.Interval != market.I1h || tg.ATR != 14 || tg.Stop != 0 {
+		t.Errorf("defaults %+v", tg)
+	}
+	for in, want := range map[string]string{
+		`{side: up, stop: 1}`:                 "targets.side",
+		`{side: long, atr: -1, stop: 1}`:      "targets.atr",
+		`{side: long, interval: 2h, stop: 1}`: "targets: unknown interval",
+		`{side: long, stop: -1}`:              "targets.stop",
+		`{side: long, take: [0]}`:             "targets.take",
+		`{side: long}`:                        "needs stop or take",
+	} {
+		_, err := Parse([]byte(head + `  - {id: a, interval: 1h, when: "close > 1", targets: ` + in + `, channels: [tg]}`))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err=%v want %q", in, err, want)
+		}
+	}
+}
+
+func TestSetup(t *testing.T) {
+	head := "symbols: [BTCUSDT]\nchannels: {tg: {type: telegram}}\nrules:\n"
+	c, err := Parse([]byte(head + `  - {id: a, interval: 15m, when: "close > 1", setup: {when: "low@1h <= ema(20)@4h", invalidate: "close@4h < ema(50)@4h", within: 8h}, channels: [tg]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	su := c.Rules[0].Setup
+	if su == nil || su.When == nil || su.Invalidate == nil || su.Within != 8*time.Hour {
+		t.Fatalf("setup %+v", su)
+	}
+	if len(c.Intervals) != 3 || c.Intervals[1] != market.I1h || c.Intervals[2] != market.I4h {
+		t.Errorf("setup intervals not derived: %v", c.Intervals)
+	}
+	for in, want := range map[string]string{
+		`{when: "close > 1"}`:                                     "missing within",
+		`{when: "close > 1", within: 0s}`:                         "within must be positive",
+		`{when: "close > 1", within: soon}`:                       "invalid within",
+		`{within: 1h}`:                                            "setup: missing when",
+		`{when: "foo(1) > 1", within: 1h}`:                        "setup.when",
+		`{when: "close > 1", invalidate: "rsi( > 1", within: 1h}`: "setup.invalidate",
+	} {
+		_, err := Parse([]byte(head + `  - {id: a, interval: 15m, when: "close > 1", setup: ` + in + `, channels: [tg]}`))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err=%v want %q", in, err, want)
+		}
+	}
+	// The realtime operand restriction covers the setup too; "@" is exempt.
+	_, err = Parse([]byte(head + `  - {id: a, interval: 15m, trigger: realtime, when: "close > 1", setup: {when: "rsi(14) < 30", within: 1h}, channels: [tg]}`))
+	if err == nil || !strings.Contains(err.Error(), "rsi(14)") {
+		t.Errorf("realtime setup rsi accepted: %v", err)
+	}
+	if _, err := Parse([]byte(head + `  - {id: a, interval: 15m, trigger: realtime, when: "close > 1", setup: {when: "rsi(14)@1h < 30", within: 1h}, channels: [tg]}`)); err != nil {
+		t.Errorf("realtime setup with @: %v", err)
+	}
+	_, err = Parse([]byte("symbols: [BTCUSDT]\nintervals: [15m]\nchannels: {tg: {type: telegram}}\nrules:\n" + `  - {id: a, interval: 15m, when: "close > 1", setup: {when: "close@1h > 1", within: 1h}, channels: [tg]}`))
+	if err == nil || !strings.Contains(err.Error(), `interval "1h" (referenced with @) not in intervals list`) {
+		t.Errorf("explicit intervals with setup @: %v", err)
 	}
 }

@@ -1,5 +1,5 @@
 symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
-# intervals: [5m, 1h]   # optional; defaults to the intervals used by rules
+# intervals: [5m, 1h, 4h]   # optional; defaults to the intervals rules use (incl. @ and targets)
 
 rules:
   - id: pump_with_volume
@@ -22,6 +22,51 @@ rules:
             - funding_rate < -0.0005
             - oi_change_pct(4) > 10
     cooldown: 1h
+    channels: [telegram]
+  # 4H trend + 1H pullback to the 4H EMA20. "@4h" reads the last closed 4h bar.
+  - id: trend_pullback_ema_long
+    interval: 1h
+    when:
+      all:
+        - ema(20)@4h > ema(50)@4h   # 4H uptrend
+        - close@4h > ema(50)@4h
+        - low <= ema(20)@4h         # 1H low touches the 4H EMA20
+        - close > ema(20)@4h        # and the 1H bar closes back above it
+    cooldown: 4h
+    targets: {side: long, atr: 14, stop: 1.5, take: [2, 3]}   # shown in the message only
+    channels: [telegram]
+  - id: trend_pullback_ema_short
+    interval: 1h
+    when:
+      all:
+        - ema(20)@4h < ema(50)@4h   # 4H downtrend
+        - close@4h < ema(50)@4h
+        - high >= ema(20)@4h        # 1H high touches the 4H EMA20
+        - close < ema(20)@4h        # and the 1H bar closes back below it
+    cooldown: 4h
+    targets: {side: short, atr: 14, stop: 1.5, take: [2, 3]}
+    channels: [telegram]
+  # Strict order: 4H uptrend + 1H pullback confirmed first (setup), then a
+  # 15m intraday breakout on volume within 8h fires once.
+  - id: trend_pullback_breakout_long
+    interval: 15m
+    trigger: realtime               # fires intraday, no need to wait for the 15m close
+    setup:
+      when:
+        all:
+          - ema(20)@4h > ema(50)@4h
+          - close@4h > ema(50)@4h
+          - low@1h <= ema(20)@4h    # 1H pullback to the 4H EMA20
+          - close@1h > ema(20)@4h   # confirmed: 1H closed back above it
+      invalidate: close@1h < ema(50)@4h   # trend broken: drop the setup
+      within: 8h
+    when:
+      all:
+        - ema(20)@4h > ema(50)@4h
+        - close > highest(20)       # price breaks the previous 20 15m bars' high
+        - volume_ratio(20) > 2      # this 15m bar's volume so far is 2x the average
+    cooldown: 4h
+    targets: {side: long, atr: 14, stop: 1.5, take: [2, 3]}
     channels: [telegram]
 
 channels:

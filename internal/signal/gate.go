@@ -30,6 +30,20 @@ type Signal struct {
 	// ChangePct is the bar's change from its open, in %; valid if HasChange.
 	ChangePct float64
 	HasChange bool
+	// Targets are ATR-based reference stop/take-profit prices; nil when the
+	// rule has none or its ATR was not ready.
+	Targets *Targets
+}
+
+// Targets holds reference prices derived from the signal price and ATR.
+type Targets struct {
+	Side        config.Side
+	ATRPeriod   int
+	ATRInterval market.Interval
+	ATR         float64
+	Stop        float64 // valid if HasStop
+	HasStop     bool
+	Takes       []float64
 }
 
 type key struct{ rule, symbol string }

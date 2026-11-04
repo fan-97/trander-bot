@@ -545,3 +545,24 @@ func TestFormat_EmptyBatch(t *testing.T) {
 		t.Fatalf("Format(empty) = %+v", m)
 	}
 }
+
+func TestFormat_Targets(t *testing.T) {
+	b := signal.Batch{Channel: "tg", Signals: []signal.Signal{
+		{RuleID: "pb", Symbol: "BTCUSDT", Interval: market.I1h, Level: config.LevelWarn, Price: 60000, Detail: "x",
+			Targets: &signal.Targets{Side: config.SideLong, ATRPeriod: 14, ATRInterval: market.I1h, ATR: 412.3456,
+				Stop: 59381.4816, HasStop: true, Takes: []float64{60824.6912, 61237.0368}}},
+		{RuleID: "pb", Symbol: "IDOLUSDT", Interval: market.I1h, Level: config.LevelWarn, Price: 0.025466, Detail: "x",
+			Targets: &signal.Targets{Side: config.SideShort, ATRPeriod: 14, ATRInterval: market.I4h, ATR: 0.00031234,
+				Takes: []float64{0.02484132}}},
+	}}
+	got := FormatIn(b, nil).Lines
+	want := []string{
+		"[1h] BTCUSDT pb @ 60000 | x | ATR(14)@1h=412.35 止损 59381.48 止盈 60824.69 / 61237.04",
+		"[1h] IDOLUSDT pb @ 0.025466 | x | ATR(14)@4h=0.000312 止盈 0.024841",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}

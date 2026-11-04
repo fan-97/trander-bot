@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"log/slog"
+	"math"
 	"reflect"
 	"slices"
 	"time"
@@ -51,7 +52,8 @@ type Worker struct {
 	lastPrice  float64
 
 	contract contract
-	started  bool // Run has begun: liq_volume reads 0 instead of unavailable
+	seq      map[string]*seqState // rule ID -> two-stage state (rules with Setup)
+	started  bool                 // Run has begun: liq_volume reads 0 instead of unavailable
 
 	// staleCheck marks signals from closed bars that arrive long after they
 	// closed (gap fill after an outage) as stale: recorded, never delivered.
@@ -93,6 +95,7 @@ func NewWorker(symbol string, cfg *config.Config, gate *signal.Gate, out chan<- 
 		log:        slog.Default().With("symbol", symbol),
 		aggs:       map[market.Interval]*market.Aggregator{},
 		inds:       map[string]indicator.Indicator{},
+		seq:        map[string]*seqState{},
 		bars:       map[market.Interval][]market.Kline{},
 		lastClosed: map[market.Interval]time.Time{},
 		staleCheck: true,
@@ -152,13 +155,22 @@ func (w *Worker) primeGate(ivs []market.Interval) {
 		if r.When == nil || w.aggs[r.Interval] == nil {
 			continue
 		}
-		if ivs != nil && !slices.Contains(ivs, r.Interval) {
+		// A rule is re-primed when any interval it reads was just warmed: a
+		// 1h rule reading ema(20)@4h is primed once 4h history arrives.
+		if ivs != nil && !slices.ContainsFunc(r.UsedIntervals(), func(iv market.Interval) bool { return slices.Contains(ivs, iv) }) {
 			continue
 		}
 		if _, ok := w.lastClosed[r.Interval]; !ok {
 			continue
 		}
-		w.gate.Prime(r.ID, w.symbol, rule.Eval(r.When, w.values(r.Interval, nil)))
+		v := w.values(r.Interval, nil)
+		if r.Setup != nil {
+			// The gate only ever sees the folded result: start it at False.
+			w.primeSequence(r, v)
+			w.gate.Prime(r.ID, w.symbol, rule.False)
+			continue
+		}
+		w.gate.Prime(r.ID, w.symbol, rule.Eval(r.When, v))
 	}
 }
 
@@ -295,7 +307,9 @@ func (w *Worker) handle(ctx context.Context, ev market.Event) error {
 			return nil // the stream delivers 1m; higher intervals are aggregated here
 		}
 		w.lastPrice = k.Close
-		for _, iv := range w.targets {
+		// Longest interval first: when 1h and 4h close on the same 1m bar, the
+		// 4h indicators update before the 1h rules read them via "@4h".
+		for _, iv := range slices.Backward(w.targets) {
 			for _, b := range w.aggs[iv].Add(k.Kline) {
 				if err := w.onBar(ctx, b, true); err != nil {
 					return err
@@ -398,6 +412,13 @@ func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, pri
 		return nil
 	}
 	res := rule.Eval(r.When, v)
+	if r.Setup != nil {
+		at := w.clk.Now()
+		if bar != nil && !live {
+			at = bar.OpenTime.Add(r.Interval.Duration()) // replayed bars keep their own time
+		}
+		res = w.sequence(r, v, res, at)
+	}
 	fire, suppressed := w.gate.Observe(r.ID, w.symbol, res, r.Cooldown)
 	if !fire && suppressed != "cooldown" {
 		return nil
@@ -409,6 +430,9 @@ func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, pri
 	if detail == "" {
 		detail = r.ID
 	}
+	if r.Setup != nil {
+		detail += seqDetail(w.seq[r.ID])
+	}
 	s := signal.Signal{
 		RuleID:     r.ID,
 		Symbol:     w.symbol,
@@ -419,6 +443,9 @@ func (w *Worker) evaluate(ctx context.Context, r config.Rule, v rule.Values, pri
 		Detail:     detail,
 		Channels:   slices.Clone(r.Channels),
 		Suppressed: suppressed,
+	}
+	if r.Targets != nil {
+		s.Targets = w.priceTargets(r.Targets, price)
 	}
 	if bar != nil {
 		s.BarTime, s.BarLive = bar.OpenTime, live
@@ -447,8 +474,10 @@ func (w *Worker) reconfigure(cfg *config.Config) {
 		switch n, ok := next[old.ID]; {
 		case !ok:
 			w.gate.ForgetRuleSymbol(old.ID, w.symbol)
-		case n.Interval != old.Interval || !reflect.DeepEqual(n.When, old.When):
+			delete(w.seq, old.ID)
+		case n.Interval != old.Interval || !reflect.DeepEqual(n.When, old.When) || !reflect.DeepEqual(n.Setup, old.Setup):
 			w.gate.ResetEdge(old.ID, w.symbol)
+			delete(w.seq, old.ID) // a changed setup starts disarmed
 		}
 	}
 	w.setConfig(cfg)
@@ -467,13 +496,12 @@ func (w *Worker) setConfig(cfg *config.Config) {
 	}
 	oiNeed, liqNeed := 0, time.Duration(0)
 	for i, r := range w.rules {
-		if r.Interval.Valid() {
-			set[r.Interval] = true
+		for _, iv := range r.UsedIntervals() {
+			if iv.Valid() {
+				set[iv] = true
+			}
 		}
-		var fs []rule.Operand
-		if r.When != nil {
-			fs = rule.Funcs(r.When)
-		}
+		fs := rule.Funcs(r.Conditions()...)
 		m := ruleMeta{contractOnly: len(fs) > 0}
 		for _, o := range fs {
 			if !o.IsContract() {
@@ -528,33 +556,68 @@ func (w *Worker) setConfig(cfg *config.Config) {
 	// Unchanged keys keep their instance; new ones replay the retained bars.
 	inds := map[string]indicator.Indicator{}
 	ivInds := map[market.Interval][]indicator.Indicator{}
+	need := func(r config.Rule, iv market.Interval, o rule.Operand) {
+		key := indKey(iv, o)
+		if _, dup := inds[key]; dup {
+			return
+		}
+		ind, ok := w.inds[key]
+		if !ok {
+			var err error
+			ind, err = newIndicator(o.Func, o.Args)
+			if err != nil {
+				w.log.Error("engine: cannot build indicator; rule stays unknown", "rule", r.ID, "operand", o.String(), "err", err)
+				return
+			}
+			for _, b := range w.bars[iv] {
+				ind.Update(b)
+			}
+		}
+		inds[key] = ind
+		ivInds[iv] = append(ivInds[iv], ind)
+	}
 	for _, r := range w.rules {
 		if r.When == nil || !r.Interval.Valid() {
 			continue
 		}
-		for _, o := range rule.Funcs(r.When) {
-			if o.IsContract() {
-				continue
+		for _, o := range rule.Funcs(r.Conditions()...) {
+			if iv := o.On(r.Interval); !o.IsContract() && iv.Valid() {
+				need(r, iv, o)
 			}
-			key := indKey(r.Interval, o)
-			if _, dup := inds[key]; dup {
-				continue
-			}
-			ind, ok := w.inds[key]
-			if !ok {
-				var err error
-				ind, err = newIndicator(o.Func, o.Args)
-				if err != nil {
-					w.log.Error("engine: cannot build indicator; rule stays unknown", "rule", r.ID, "operand", o.String(), "err", err)
-					continue
-				}
-				for _, b := range w.bars[r.Interval] {
-					ind.Update(b)
-				}
-			}
-			inds[key] = ind
-			ivInds[r.Interval] = append(ivInds[r.Interval], ind)
+		}
+		if t := r.Targets; t != nil && t.Interval.Valid() {
+			need(r, t.Interval, targetsATR(t))
 		}
 	}
 	w.inds, w.ivInds = inds, ivInds
+}
+
+// targetsATR is the ATR operand a Targets reads.
+func targetsATR(t *config.Targets) rule.Operand {
+	return rule.Operand{Func: "atr", Args: []float64{float64(t.ATR)}}
+}
+
+// priceTargets computes reference stop/take-profit prices from price and the
+// last closed ATR of t.Interval; nil while that ATR is not ready.
+func (w *Worker) priceTargets(t *config.Targets, price float64) *signal.Targets {
+	ind := w.inds[indKey(t.Interval, targetsATR(t))]
+	if ind == nil || price <= 0 {
+		return nil
+	}
+	atr, ok := ind.Value()
+	if !ok || !(atr > 0) || math.IsInf(atr, 0) {
+		return nil
+	}
+	dir := 1.0
+	if t.Side == config.SideShort {
+		dir = -1
+	}
+	out := &signal.Targets{Side: t.Side, ATRPeriod: t.ATR, ATRInterval: t.Interval, ATR: atr}
+	if t.Stop > 0 {
+		out.Stop, out.HasStop = price-dir*t.Stop*atr, true
+	}
+	for _, k := range t.Take {
+		out.Takes = append(out.Takes, price+dir*k*atr)
+	}
+	return out
 }
