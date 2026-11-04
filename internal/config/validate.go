@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -23,6 +24,7 @@ var channelTypes = map[string]bool{
 var realtimeFuncs = map[string]bool{
 	"close": true, "change_pct": true, "volume": true,
 	"open": true, "high": true, "low": true, "amplitude_pct": true, "volume_ratio": true,
+	"highest": true, "lowest": true, // exclude the current bar: fixed while it is open
 }
 
 // Validate checks the whole config and returns every problem found, joined.
@@ -76,13 +78,45 @@ func (c *Config) Validate() error {
 		} else if c.explicitIntervals && !hasInterval[r.Interval] {
 			add("rule %q: interval %q not in intervals list", r.ID, r.Interval)
 		}
+		if c.explicitIntervals {
+			for _, iv := range rule.Intervals(r.Conditions()...) {
+				if !hasInterval[iv] {
+					add("rule %q: interval %q (referenced with @) not in intervals list", r.ID, iv)
+				}
+			}
+		}
+		if t := r.Targets; t != nil {
+			if t.Side != SideLong && t.Side != SideShort {
+				add("rule %q: targets.side must be long or short, got %q", r.ID, t.Side)
+			}
+			if t.ATR < 1 || t.ATR > 1e6 {
+				add("rule %q: targets.atr must be a positive period, got %d", r.ID, t.ATR)
+			}
+			if !t.Interval.Valid() {
+				add("rule %q: targets: unknown interval %q", r.ID, t.Interval)
+			} else if c.explicitIntervals && !hasInterval[t.Interval] {
+				add("rule %q: targets.interval %q not in intervals list", r.ID, t.Interval)
+			}
+			if t.Stop < 0 || math.IsNaN(t.Stop) || math.IsInf(t.Stop, 0) {
+				add("rule %q: targets.stop must be a non-negative ATR multiple", r.ID)
+			}
+			for _, k := range t.Take {
+				if !(k > 0) || math.IsInf(k, 0) {
+					add("rule %q: targets.take values must be positive ATR multiples, got %v", r.ID, k)
+				}
+			}
+			if t.Stop == 0 && len(t.Take) == 0 {
+				add("rule %q: targets needs stop or take", r.ID)
+			}
+		}
 		if r.Trigger != TriggerOnClose && r.Trigger != TriggerRealtime {
 			add("rule %q: unknown trigger %q", r.ID, r.Trigger)
 		}
-		if r.Trigger == TriggerRealtime && r.When != nil {
-			for _, o := range rule.Funcs(r.When) {
-				if !o.IsContract() && !realtimeFuncs[o.Func] {
-					add("rule %q: %s is not supported with trigger realtime (only close, open, high, low, change_pct, amplitude_pct, volume, volume_ratio and contract data)", r.ID, o)
+		if r.Trigger == TriggerRealtime {
+			for _, o := range rule.Funcs(r.Conditions()...) {
+				// "@" operands read a closed bar, so any indicator works.
+				if !o.IsContract() && o.Interval == "" && !realtimeFuncs[o.Func] {
+					add("rule %q: %s is not supported with trigger realtime (only close, open, high, low, change_pct, amplitude_pct, volume, volume_ratio, highest, lowest, @ operands and contract data)", r.ID, o)
 				}
 			}
 		}

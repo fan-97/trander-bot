@@ -98,8 +98,12 @@ func FormatIn(b signal.Batch, loc *time.Location) Message {
 		if s.HasChange {
 			change = fmt.Sprintf(" 本根 %+.2f%%", s.ChangePct)
 		}
-		m.Lines = append(m.Lines, fmt.Sprintf("[%s] %s %s @ %s%s | %s",
-			head, s.Symbol, s.RuleID, strconv.FormatFloat(s.Price, 'f', -1, 64), change, detail))
+		line := fmt.Sprintf("[%s] %s %s @ %s%s | %s",
+			head, s.Symbol, s.RuleID, strconv.FormatFloat(s.Price, 'f', -1, 64), change, detail)
+		if s.Targets != nil {
+			line += " | " + formatTargets(s.Targets, s.Price)
+		}
+		m.Lines = append(m.Lines, line)
 		if !seen[s.Symbol] {
 			seen[s.Symbol] = true
 			m.Links = append(m.Links,
@@ -109,4 +113,33 @@ func FormatIn(b signal.Batch, loc *time.Location) Message {
 	}
 	m.Title = fmt.Sprintf("[%s] %d signal(s)", strings.ToUpper(string(m.Level)), len(b.Signals))
 	return m
+}
+
+// formatTargets renders e.g. "ATR(14)@1h=123.4 止损 64000 止盈 66000 / 67500",
+// with prices at the signal price's precision (at least 2, at most 8 places).
+func formatTargets(t *signal.Targets, price float64) string {
+	dec := 2
+	if p := strconv.FormatFloat(price, 'f', -1, 64); strings.Contains(p, ".") {
+		dec = max(dec, min(len(p)-strings.IndexByte(p, '.')-1, 8))
+	}
+	f := func(v float64) string {
+		s := strconv.FormatFloat(v, 'f', dec, 64)
+		if strings.Contains(s, ".") {
+			s = strings.TrimSuffix(strings.TrimRight(s, "0"), ".")
+		}
+		return s
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "ATR(%d)@%s=%s", t.ATRPeriod, t.ATRInterval, f(t.ATR))
+	if t.HasStop {
+		b.WriteString(" 止损 " + f(t.Stop))
+	}
+	if len(t.Takes) > 0 {
+		parts := make([]string, len(t.Takes))
+		for i, v := range t.Takes {
+			parts[i] = f(v)
+		}
+		b.WriteString(" 止盈 " + strings.Join(parts, " / "))
+	}
+	return b.String()
 }

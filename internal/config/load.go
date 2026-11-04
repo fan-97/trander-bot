@@ -40,15 +40,38 @@ type rawConfig struct {
 }
 
 type rawRule struct {
-	ID       string     `yaml:"id"`
-	Symbols  stringList `yaml:"symbols"`
-	Interval string     `yaml:"interval"`
-	Trigger  string     `yaml:"trigger"`
-	When     yaml.Node  `yaml:"when"`
-	Cooldown string     `yaml:"cooldown"`
-	Channels []string   `yaml:"channels"`
-	Level    string     `yaml:"level"`
+	ID       string      `yaml:"id"`
+	Symbols  stringList  `yaml:"symbols"`
+	Interval string      `yaml:"interval"`
+	Trigger  string      `yaml:"trigger"`
+	When     yaml.Node   `yaml:"when"`
+	Cooldown string      `yaml:"cooldown"`
+	Channels []string    `yaml:"channels"`
+	Level    string      `yaml:"level"`
+	Targets  *rawTargets `yaml:"targets"`
+	Setup    *rawSetup   `yaml:"setup"`
 }
+
+type rawSetup struct {
+	When       yaml.Node `yaml:"when"`
+	Invalidate yaml.Node `yaml:"invalidate"`
+	Within     string    `yaml:"within"`
+}
+
+func emptyNode(n *yaml.Node) bool {
+	return n.IsZero() || n.Tag == "!!null" || (n.Kind == yaml.ScalarNode && n.Value == "")
+}
+
+type rawTargets struct {
+	Side     string    `yaml:"side"`
+	ATR      int       `yaml:"atr"`
+	Interval string    `yaml:"interval"`
+	Stop     float64   `yaml:"stop"`
+	Take     []float64 `yaml:"take"`
+}
+
+// defaultTargetsATR is the ATR period when targets omit atr.
+const defaultTargetsATR = 14
 
 type rawChannel struct {
 	Type     string            `yaml:"type"`
@@ -164,6 +187,15 @@ func (r *rawConfig) build() (*Config, error) {
 		if len(r2.Symbols) == 0 {
 			r2.Symbols = []string{AllSymbols}
 		}
+		if t := rr.Targets; t != nil {
+			r2.Targets = &Targets{Side: Side(t.Side), ATR: t.ATR, Interval: market.Interval(t.Interval), Stop: t.Stop, Take: t.Take}
+			if r2.Targets.ATR == 0 {
+				r2.Targets.ATR = defaultTargetsATR
+			}
+			if r2.Targets.Interval == "" {
+				r2.Targets.Interval = r2.Interval
+			}
+		}
 		if r2.Trigger == "" {
 			r2.Trigger = TriggerOnClose
 		}
@@ -179,7 +211,33 @@ func (r *rawConfig) build() (*Config, error) {
 		} else {
 			r2.Cooldown = defaultCooldown(r2.Interval)
 		}
-		if w := &rr.When; w.IsZero() || w.Tag == "!!null" || (w.Kind == yaml.ScalarNode && w.Value == "") {
+		if su := rr.Setup; su != nil {
+			r2.Setup = &Setup{}
+			if emptyNode(&su.When) {
+				errs = append(errs, fmt.Errorf("rule %q: setup: missing when", rr.ID))
+			} else if n, err := rule.Parse(&su.When); err != nil {
+				errs = append(errs, fmt.Errorf("rule %q: setup.when: %w", rr.ID, err))
+			} else {
+				r2.Setup.When = n
+			}
+			if !emptyNode(&su.Invalidate) {
+				if n, err := rule.Parse(&su.Invalidate); err != nil {
+					errs = append(errs, fmt.Errorf("rule %q: setup.invalidate: %w", rr.ID, err))
+				} else {
+					r2.Setup.Invalidate = n
+				}
+			}
+			if su.Within == "" {
+				errs = append(errs, fmt.Errorf("rule %q: setup: missing within", rr.ID))
+			} else if d, err := time.ParseDuration(su.Within); err != nil {
+				errs = append(errs, fmt.Errorf("rule %q: setup: invalid within %q: %w", rr.ID, su.Within, err))
+			} else if d <= 0 {
+				errs = append(errs, fmt.Errorf("rule %q: setup: within must be positive", rr.ID))
+			} else {
+				r2.Setup.Within = d
+			}
+		}
+		if w := &rr.When; emptyNode(w) {
 			errs = append(errs, fmt.Errorf("rule %q: missing when", rr.ID))
 		} else if n, err := rule.Parse(w); err != nil {
 			errs = append(errs, fmt.Errorf("rule %q: when: %w", rr.ID, err))
@@ -201,10 +259,12 @@ func (r *rawConfig) build() (*Config, error) {
 		c.explicitIntervals = true
 	} else {
 		seen := map[market.Interval]bool{}
-		for _, rule := range c.Rules {
-			if rule.Interval.Valid() && !seen[rule.Interval] {
-				seen[rule.Interval] = true
-				c.Intervals = append(c.Intervals, rule.Interval)
+		for _, r := range c.Rules {
+			for _, iv := range r.UsedIntervals() {
+				if iv.Valid() && !seen[iv] {
+					seen[iv] = true
+					c.Intervals = append(c.Intervals, iv)
+				}
 			}
 		}
 	}
@@ -253,6 +313,21 @@ const minDefaultCooldown = 15 * time.Minute
 // to disable it.
 func defaultCooldown(iv market.Interval) time.Duration {
 	return max(iv.Duration(), minDefaultCooldown)
+}
+
+// UsedIntervals returns every interval r reads: its own, those referenced by
+// "@" operands (in When and Setup) and its targets' ATR interval (unvalidated, deduplicated).
+func (r Rule) UsedIntervals() []market.Interval {
+	out := []market.Interval{r.Interval}
+	for _, iv := range rule.Intervals(r.Conditions()...) {
+		if !slices.Contains(out, iv) {
+			out = append(out, iv)
+		}
+	}
+	if r.Targets != nil && !slices.Contains(out, r.Targets.Interval) {
+		out = append(out, r.Targets.Interval)
+	}
+	return out
 }
 
 // RulesFor returns the rules that apply to symbol.

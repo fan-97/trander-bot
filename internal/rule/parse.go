@@ -9,6 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"trader-bot/internal/indicator"
+	"trader-bot/internal/market"
 )
 
 // Parse converts a YAML condition (mapping with all/any/not, or a leaf string)
@@ -114,6 +115,7 @@ const (
 	tRParen
 	tComma
 	tCmp
+	tAt // "@<interval>"; text is the interval
 )
 
 type token struct {
@@ -158,6 +160,12 @@ func (p *parser) next() error {
 	case c == ',':
 		p.i++
 		p.tok = token{kind: tComma, text: ",", pos: start}
+	case c == '@':
+		p.i++
+		for p.i < len(s) && (isIdentStart(s[p.i]) || isDigit(s[p.i])) {
+			p.i++
+		}
+		p.tok = token{kind: tAt, text: s[start+1 : p.i], pos: start}
 	case c == '>' || c == '<':
 		p.i++
 		if p.i < len(s) && s[p.i] == '=' {
@@ -307,6 +315,9 @@ func (p *parser) operand() (Operand, error) {
 		if err := p.next(); err != nil {
 			return Operand{}, err
 		}
+		if p.tok.kind == tAt {
+			return Operand{}, p.errf(p.tok.pos, "a constant cannot take an interval suffix")
+		}
 		return Operand{Const: &v}, nil
 	case tIdent:
 		name, pos := p.tok.text, p.tok.pos
@@ -339,7 +350,21 @@ func (p *parser) operand() (Operand, error) {
 		if err := validateFunc(name, args); err != nil {
 			return Operand{}, p.errf(pos, "%v", err)
 		}
-		return Operand{Func: name, Args: args}, nil
+		o := Operand{Func: name, Args: args}
+		if p.tok.kind == tAt {
+			iv, at := market.Interval(p.tok.text), p.tok.pos
+			switch {
+			case o.IsContract():
+				return Operand{}, p.errf(at, "%s is contract data and cannot take an interval suffix", name)
+			case !iv.Valid():
+				return Operand{}, p.errf(at, "unknown interval %q (want 1m, 5m, 15m, 1h, 4h or 1d)", p.tok.text)
+			}
+			o.Interval = iv
+			if err := p.next(); err != nil {
+				return Operand{}, err
+			}
+		}
+		return o, nil
 	default:
 		return Operand{}, p.errf(p.tok.pos, "expected indicator or number, got %s", p.describe())
 	}

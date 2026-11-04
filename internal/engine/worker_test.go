@@ -731,3 +731,157 @@ func TestWorker_SignalCarriesBar(t *testing.T) {
 		t.Fatalf("realtime bar time=%v live=%v change=%v", s.BarTime, s.BarLive, s.ChangePct)
 	}
 }
+
+// minutes returns closed 1m bars for minutes [from, to) at close c.
+func minutes(from, to int, c float64) []market.Event {
+	var out []market.Event
+	for m := from; m < to; m++ {
+		out = append(out, k1(sym, m, c, 1, true))
+	}
+	return out
+}
+
+// At a shared boundary the higher interval closes first, so a 5m rule reading
+// close@15m sees the 15m bar that closed on the same 1m bar.
+func TestWorker_CrossIntervalSeesBarClosedOnSameMinute(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: x, interval: 5m, when: "close@15m > 150", cooldown: 0s, channels: [tg]}`))
+	evs := append(minutes(0, 15, 100), minutes(15, 25, 200)...)
+	if got := h.handle(t, evs...); len(got) != 0 {
+		t.Fatalf("fired before the 15m bar closed above 150: %v", ids(got))
+	}
+	got := h.handle(t, minutes(25, 30, 200)...)
+	if len(got) != 1 || !got[0].BarTime.Equal(t0.Add(25*time.Minute)) {
+		t.Fatalf("want one fire on the 5m bar at 00:25, got %+v", got)
+	}
+	if !strings.Contains(got[0].Detail, "close@15m=200 > 150") {
+		t.Errorf("detail %q", got[0].Detail)
+	}
+}
+
+// In a realtime rule an "@" operand reads the last closed bar, never the live one.
+func TestWorker_CrossIntervalRealtimeUsesClosedBar(t *testing.T) {
+	h := newHarness(t, parseCfg(t,
+		`{id: at, interval: 5m, trigger: realtime, when: "close@5m > 150", channels: [tg]}`,
+		`{id: own, interval: 5m, trigger: realtime, when: "close > 150", channels: [tg]}`))
+	got := h.handle(t, append(minutes(0, 5, 100), k1(sym, 5, 200, 1, false))...)
+	if len(got) != 1 || got[0].RuleID != "own" {
+		t.Fatalf("want only the live-bar rule to fire, got %v", ids(got))
+	}
+}
+
+// Until the referenced interval is warm the rule is unknown and silent.
+func TestWorker_CrossIntervalUnwarmedIsSilent(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: x, interval: 5m, when: "ema(3)@15m > 0", channels: [tg]}`))
+	if got := h.handle(t, minutes(0, 30, 100)...); len(got) != 0 {
+		t.Fatalf("fired with ema(3)@15m not ready: %v", ids(got))
+	}
+	if got := h.handle(t, minutes(30, 45, 100)...); len(got) != 1 {
+		t.Fatalf("want a fire once 3 15m bars closed, got %v", ids(got))
+	}
+}
+
+// ema(20)@15m in a 5m rule shares the 15m rule's ema(20) instance.
+func TestWorker_CrossIntervalSharesIndicator(t *testing.T) {
+	h := newHarness(t, parseCfg(t,
+		`{id: a, interval: 5m, when: "close > ema(20)@15m", channels: [tg]}`,
+		`{id: b, interval: 15m, when: "close > ema(20)", channels: [tg]}`))
+	if n := len(h.w.ivInds[market.I15m]); n != 2 { // ema(20) + close
+		t.Fatalf("15m indicators = %d, want 2", n)
+	}
+	if h.w.inds["15m|ema(20)"] == nil || h.w.aggs[market.I15m] == nil {
+		t.Fatal("15m not tracked")
+	}
+}
+
+func histHL(n int) map[market.Interval][]market.Kline {
+	var ks []market.Kline
+	for i := 0; i < n; i++ {
+		ks = append(ks, market.Kline{Symbol: sym, Interval: market.I5m, OpenTime: t0.Add(time.Duration(i) * 5 * time.Minute),
+			Open: 100, High: 101, Low: 99, Close: 100, Volume: 10, Closed: true})
+	}
+	return map[market.Interval][]market.Kline{market.I5m: ks}
+}
+
+func TestWorker_PriceTargets(t *testing.T) {
+	cfg := parseCfg(t,
+		`{id: l, interval: 5m, when: "close > 0", targets: {side: long, atr: 3, stop: 1, take: [2, 3]}, channels: [tg]}`,
+		`{id: s, interval: 5m, when: "close > 0", targets: {side: short, atr: 3, take: [2]}, channels: [tg]}`)
+	h := newHarness(t, cfg)
+	h.w.Warmup(histHL(10)) // every TR is 2, so ATR(3) = 2
+	long := h.w.priceTargets(cfg.Rules[0].Targets, 100)
+	if long == nil || long.ATR != 2 || !long.HasStop || long.Stop != 98 || len(long.Takes) != 2 || long.Takes[0] != 104 || long.Takes[1] != 106 {
+		t.Fatalf("long %+v", long)
+	}
+	short := h.w.priceTargets(cfg.Rules[1].Targets, 100)
+	if short == nil || short.HasStop || len(short.Takes) != 1 || short.Takes[0] != 96 || short.Side != config.SideShort {
+		t.Fatalf("short %+v", short)
+	}
+
+	// A firing rule carries its targets, using the ATR after the closed bar.
+	h2 := newHarness(t, parseCfg(t, `{id: l, interval: 5m, when: "close > 0", targets: {side: long, atr: 3, stop: 1}, channels: [tg]}`))
+	got := h2.handle(t, minutes(0, 5, 100)...)
+	if len(got) != 1 || got[0].Targets != nil {
+		t.Fatalf("ATR not ready yet: want a fire without targets, got %+v", got)
+	}
+	h3 := newHarness(t, parseCfg(t, `{id: l, interval: 5m, when: "close > 150", targets: {side: long, atr: 3, stop: 1}, channels: [tg]}`))
+	h3.w.Warmup(histHL(10))
+	got = h3.handle(t, minutes(50, 55, 200)...)
+	// TR of the 200 bar is 100: ATR = (2*2 + 100) / 3; stop = 200 - ATR.
+	atr := 104.0 / 3
+	if len(got) != 1 || got[0].Targets == nil || abs(got[0].Targets.ATR-atr) > 1e-9 || abs(got[0].Targets.Stop-(200-atr)) > 1e-9 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestValues_ProvisionalHighestLowest(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: rt, interval: 5m, trigger: realtime, when: {all: ["close > highest(3)", "close > lowest(3)"]}, channels: [tg]}`))
+	h.w.Warmup(hist5(30, func(i int) (float64, float64) { return 100 + float64(i), 10 })) // flat bars, closes 100..129
+	live := market.Kline{Symbol: sym, Interval: market.I5m, OpenTime: t0.Add(150 * time.Minute), Open: 129, High: 140, Low: 90, Close: 135}
+	v := h.w.values(market.I5m, &live)
+	// The live bar's own high/low never count: previous 3 closed bars only.
+	for o, want := range map[string][2]float64{"highest(3)": {129, 128}, "lowest(3)": {127, 126}} {
+		op := rule.Operand{Func: strings.TrimSuffix(o, "(3)"), Args: []float64{3}}
+		c, p, ok := v.Get(op)
+		if !ok || c != want[0] || p != want[1] {
+			t.Errorf("%s = %v prev %v ok %v, want %v", o, c, p, ok, want)
+		}
+	}
+	// Matches the closed-bar indicator once the bar closes.
+	if ind := h.w.inds["5m|highest(3)"]; ind != nil {
+		if c, _ := ind.Value(); c != 128 {
+			t.Errorf("closed highest(3) = %v, want 128 (bars 26..28)", c)
+		}
+	}
+	h2 := newHarness(t, parseCfg(t, `{id: rt, interval: 5m, trigger: realtime, when: "close > highest(3)", channels: [tg]}`))
+	h2.w.Warmup(hist5(2, flat))
+	if _, _, ok := h2.w.values(market.I5m, &live).Get(rule.Operand{Func: "highest", Args: []float64{3}}); ok {
+		t.Fatal("highest(3) defined with 2 closed bars")
+	}
+}
+
+// An intraday volume breakout fires once on the live bar, then stays quiet
+// while the condition holds.
+func TestWorker_RealtimeVolumeBreakout(t *testing.T) {
+	h := newHarness(t, parseCfg(t, `{id: bo, interval: 5m, trigger: realtime, when: {all: ["close > highest(3)", "volume_ratio(3) > 2"]}, cooldown: 0s, channels: [tg]}`))
+	h.w.Warmup(hist5(10, flat)) // closes 100, volume 10 per 5m bar
+	// Bucket 00:50: price breaks the 100 high at minute 51, but its volume so
+	// far (1 per 1m bar) stays below 2x the 10 average until minute 53.
+	got := h.handle(t,
+		k1o(50, 100, 100, true),
+		k1o(51, 100, 101, true), // breakout, volume 2 so far: no
+		k1o(52, 101, 102, true), // volume 3: no
+	)
+	if len(got) != 0 {
+		t.Fatalf("fired without volume: %v", ids(got))
+	}
+	big := market.KlineEvent{Kline: market.Kline{Symbol: sym, Interval: market.I1m, OpenTime: t0.Add(53 * time.Minute),
+		Open: 102, High: 103, Low: 102, Close: 103, Volume: 30, Closed: false}}
+	got = h.handle(t, big)
+	if len(got) != 1 || !got[0].BarLive || !strings.Contains(got[0].Detail, "close=103 > highest(3)=100") {
+		t.Fatalf("want one live fire, got %+v", got)
+	}
+	big.Close, big.High = 104, 104
+	if got = h.handle(t, big); len(got) != 0 {
+		t.Fatalf("re-fired while still true: %v", ids(got))
+	}
+}

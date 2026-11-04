@@ -208,18 +208,25 @@ func (w *Worker) values(iv market.Interval, live *market.Kline) values {
 	return values{w: w, iv: iv, now: w.clk.Now(), live: live}
 }
 
-func indKey(iv market.Interval, o rule.Operand) string { return string(iv) + "|" + o.String() }
+// indKey identifies a shared indicator instance: the interval it is fed and
+// the operand without its "@" suffix, so ema(20)@4h in a 1h rule and ema(20)
+// in a 4h rule share one instance.
+func indKey(iv market.Interval, o rule.Operand) string {
+	return string(iv) + "|" + o.Local().String()
+}
 
 func (v values) Get(o rule.Operand) (cur, prev float64, ok bool) {
 	if o.IsContract() {
 		return v.w.contract.get(o, v.now, v.w.started)
 	}
-	if v.live != nil {
+	// An "@" operand always reads its interval's last closed bar, even in a
+	// realtime rule, so a higher interval never repaints into a signal.
+	if v.live != nil && o.Interval == "" {
 		if cur, prev, ok, handled := v.provisional(o); handled {
 			return cur, prev, ok
 		}
 	}
-	ind := v.w.inds[indKey(v.iv, o)]
+	ind := v.w.inds[indKey(o.On(v.iv), o)]
 	if ind == nil {
 		return 0, 0, false
 	}
@@ -294,6 +301,19 @@ func (v values) provisional(o rule.Operand) (cur, prev float64, ok, handled bool
 			}
 		}
 		return cur, prev, true, true
+	case "highest", "lowest":
+		// Both exclude the current bar, so on a live bar they are the extreme
+		// of the previous k closed bars: fixed for the whole bar, never
+		// repainted. prev is the value at the last closed bar.
+		k, valid := posInt(o.Args)
+		if !valid || n < k {
+			return 0, 0, false, true
+		}
+		cur = extreme(bars[n-k:], o.Func == "highest")
+		if n >= k+1 {
+			prev = extreme(bars[n-1-k:n-1], o.Func == "highest")
+		}
+		return cur, prev, true, true
 	case "volume_ratio":
 		// The live bar's volume so far against the mean of the previous k
 		// closed bars: early in a bar it understates, so it errs on quiet.
@@ -313,6 +333,22 @@ func (v values) provisional(o rule.Operand) (cur, prev float64, ok, handled bool
 		return cur, prev, true, true
 	}
 	return 0, 0, false, false
+}
+
+// extreme is the highest high (hi) or lowest low of bs; bs is non-empty.
+func extreme(bs []market.Kline, hi bool) float64 {
+	m := bs[0].High
+	if !hi {
+		m = bs[0].Low
+	}
+	for _, b := range bs[1:] {
+		if hi {
+			m = max(m, b.High)
+		} else {
+			m = min(m, b.Low)
+		}
+	}
+	return m
 }
 
 func volRatio(vol float64, base []market.Kline) (float64, bool) {

@@ -2,8 +2,11 @@
 package rule
 
 import (
+	"slices"
 	"strconv"
 	"strings"
+
+	"trader-bot/internal/market"
 )
 
 // Node is a condition tree node: All, Any, Not or Leaf.
@@ -39,10 +42,27 @@ const (
 )
 
 // Operand is a function call (Func != "") or a numeric constant (Const != nil).
+// Interval, set by an "@4h" suffix, makes a kline function read another
+// interval's last closed bar; empty means the rule's own interval.
 type Operand struct {
-	Func  string
-	Args  []float64
-	Const *float64
+	Func     string
+	Args     []float64
+	Const    *float64
+	Interval market.Interval
+}
+
+// Local returns o without its interval suffix.
+func (o Operand) Local() Operand {
+	o.Interval = ""
+	return o
+}
+
+// On returns the interval o reads: its own suffix, else def.
+func (o Operand) On(def market.Interval) market.Interval {
+	if o.Interval != "" {
+		return o.Interval
+	}
+	return def
 }
 
 // contractArity lists contract-data functions (provided by the worker, not
@@ -68,8 +88,12 @@ func (o Operand) IsContract() bool {
 
 func fmtNum(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
 
-// String returns the canonical text, e.g. "rsi(14)", "close", "-0.0005".
+// String returns the canonical text, e.g. "rsi(14)", "close", "-0.0005",
+// "ema(20)@4h".
 func (o Operand) String() string {
+	if o.Interval != "" {
+		return o.Local().String() + "@" + string(o.Interval)
+	}
 	if o.Func == "" {
 		if o.Const == nil {
 			return ""
@@ -86,8 +110,20 @@ func (o Operand) String() string {
 	return o.Func + "(" + strings.Join(parts, ",") + ")"
 }
 
-// Funcs returns the unique function operands used by n, in first-seen order.
-func Funcs(n Node) []Operand {
+// Intervals returns the unique "@" intervals referenced by ns, in first-seen
+// order.
+func Intervals(ns ...Node) []market.Interval {
+	var out []market.Interval
+	for _, o := range Funcs(ns...) {
+		if o.Interval != "" && !slices.Contains(out, o.Interval) {
+			out = append(out, o.Interval)
+		}
+	}
+	return out
+}
+
+// Funcs returns the unique function operands used by ns, in first-seen order.
+func Funcs(ns ...Node) []Operand {
 	var out []Operand
 	seen := map[string]bool{}
 	add := func(o Operand) {
@@ -117,6 +153,8 @@ func Funcs(n Node) []Operand {
 			add(v.Right)
 		}
 	}
-	walk(n)
+	for _, n := range ns {
+		walk(n)
+	}
 	return out
 }
