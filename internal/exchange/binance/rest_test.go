@@ -452,3 +452,41 @@ func TestREST_429PausesAllCallers(t *testing.T) {
 		t.Fatalf("second caller ran after only %v", el)
 	}
 }
+
+func TestREST_Contracts(t *testing.T) {
+	r := newTestREST(t, func(w http.ResponseWriter, req *http.Request) {
+		fmt.Fprint(w, `{"symbols":[
+			{"symbol":"BTCUSDT","contractType":"PERPETUAL","quoteAsset":"USDT","status":"TRADING","baseAsset":"BTC","underlyingType":"COIN","onboardDate":1569398400000},
+			{"symbol":"BTCDOMUSDT","contractType":"PERPETUAL","quoteAsset":"USDT","status":"TRADING","baseAsset":"BTCDOM","underlyingType":"INDEX"},
+			{"symbol":"OLDUSDT","contractType":"PERPETUAL","quoteAsset":"USDT","status":"SETTLING","baseAsset":"OLD","underlyingType":"COIN"}]}`)
+	}, 1200, clock.NewFake(t0))
+	got, err := r.Contracts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Contract{
+		{Symbol: "BTCUSDT", BaseAsset: "BTC", UnderlyingType: "COIN", OnboardDate: time.UnixMilli(1569398400000).UTC()},
+		{Symbol: "BTCDOMUSDT", BaseAsset: "BTCDOM", UnderlyingType: "INDEX"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestREST_Tickers24h(t *testing.T) {
+	r := newTestREST(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/fapi/v1/ticker/24hr" || req.URL.RawQuery != "" {
+			t.Errorf("request %s?%s", req.URL.Path, req.URL.RawQuery)
+		}
+		fmt.Fprint(w, `[{"symbol":"BTCUSDT","priceChangePercent":"-1.25","quoteVolume":"12345678.9"},
+			{"symbol":"ETHUSDT","priceChangePercent":"3","quoteVolume":"100"}]`)
+	}, 1200, clock.NewFake(t0))
+	got, err := r.Tickers24h(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Ticker24h{{"BTCUSDT", 12345678.9, -1.25}, {"ETHUSDT", 100, 3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v", got)
+	}
+}

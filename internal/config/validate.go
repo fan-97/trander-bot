@@ -32,8 +32,37 @@ func (c *Config) Validate() error {
 	var errs []error
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
-	if len(c.Symbols) == 0 {
-		add("symbols: watch pool is empty")
+	autoOn := c.AutoSymbols != nil && c.AutoSymbols.Enabled
+	if len(c.Symbols) == 0 && !autoOn {
+		add("symbols: watch pool is empty (list symbols or enable auto_symbols)")
+	}
+	if a := c.AutoSymbols; a != nil {
+		if a.Top < 1 || a.Top > 200 {
+			add("auto_symbols.top must be 1..200, got %d", a.Top)
+		}
+		switch a.RankBy {
+		case RankVolumeGrowth, RankQuoteVolume, RankAbsChange, RankGain:
+		default:
+			add("auto_symbols.rank_by: unknown %q (want volume_growth, quote_volume, abs_change or gain)", a.RankBy)
+		}
+		if a.Days < 1 || a.Days > 60 {
+			add("auto_symbols.days must be 1..60, got %d", a.Days)
+		}
+		if a.BaseDays < 1 || a.BaseDays > 60 {
+			add("auto_symbols.base_days must be 1..60, got %d", a.BaseDays)
+		}
+		if a.KeepRank < a.Top {
+			add("auto_symbols.keep_rank (%d) must be >= top (%d)", a.KeepRank, a.Top)
+		}
+		if a.MinQuoteVolume < 0 || math.IsNaN(a.MinQuoteVolume) {
+			add("auto_symbols.min_quote_volume must be >= 0")
+		}
+		if a.MinListingDays < 0 {
+			add("auto_symbols.min_listing_days must be >= 0")
+		}
+		if a.Refresh < 10*time.Minute {
+			add("auto_symbols.refresh must be at least 10m, got %v", a.Refresh)
+		}
 	}
 	pool := map[string]bool{}
 	for _, s := range c.Symbols {
@@ -135,7 +164,9 @@ func (c *Config) Validate() error {
 			}
 		}
 		for _, s := range r.Symbols {
-			if s != AllSymbols && !pool[s] {
+			if s == AutoSymbolsGroup && !autoOn {
+				add("rule %q: symbols \"auto\" needs auto_symbols enabled", r.ID)
+			} else if !IsSymbolGroup(s) && !pool[s] {
 				add("rule %q: symbol %q not in watch pool", r.ID, s)
 			}
 		}

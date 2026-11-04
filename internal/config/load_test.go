@@ -326,3 +326,82 @@ func TestSetup(t *testing.T) {
 		t.Errorf("explicit intervals with setup @: %v", err)
 	}
 }
+
+func TestAutoSymbols(t *testing.T) {
+	ch := "channels: {tg: {type: telegram}}\n"
+	rule := "rules: [{id: a, symbols: all, interval: 1h, when: \"close > 1\", channels: [tg]}]\n"
+	// Section present with defaults; manual symbols may be empty.
+	c, err := Parse([]byte(ch + rule + "auto_symbols: {exclude: [usdcusdt, ' btcdomusdt ']}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.AutoSymbols
+	if a == nil || !a.Enabled || a.Top != 20 || a.RankBy != RankVolumeGrowth || a.Days != 7 || a.BaseDays != 30 ||
+		a.MinQuoteVolume != 20e6 || a.MinListingDays != 30 || a.KeepRank != 30 || a.Refresh != 6*time.Hour ||
+		len(a.Exclude) != 2 || a.Exclude[1] != "BTCDOMUSDT" {
+		t.Fatalf("defaults %+v", a)
+	}
+	// Explicit zero thresholds are kept, not defaulted.
+	c, err = Parse([]byte(ch + rule + "auto_symbols: {top: 10, min_quote_volume: 0, min_listing_days: 0, rank_by: gain, refresh: 1h}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := c.AutoSymbols; a.MinQuoteVolume != 0 || a.MinListingDays != 0 || a.KeepRank != 15 || a.RankBy != RankGain {
+		t.Fatalf("explicit %+v", a)
+	}
+	// Disabled: the empty pool is an error again, and "auto" rules too.
+	_, err = Parse([]byte(ch + "rules: [{id: a, symbols: auto, interval: 1h, when: \"close > 1\", channels: [tg]}]\nauto_symbols: {enabled: false}\n"))
+	if err == nil || !strings.Contains(err.Error(), "watch pool is empty") || !strings.Contains(err.Error(), `symbols "auto" needs auto_symbols`) {
+		t.Fatalf("disabled: %v", err)
+	}
+	for in, want := range map[string]string{
+		"{top: 0}":                "", // 0 means default
+		"{top: 500}":              "auto_symbols.top",
+		"{rank_by: hot}":          "auto_symbols.rank_by",
+		"{days: 90}":              "auto_symbols.days",
+		"{top: 20, keep_rank: 5}": "keep_rank",
+		"{refresh: 1m}":           "auto_symbols.refresh must be",
+		"{refresh: soon}":         "auto_symbols.refresh: invalid",
+		"{min_quote_volume: -1}":  "min_quote_volume",
+	} {
+		_, err := Parse([]byte(ch + rule + "auto_symbols: " + in + "\n"))
+		if want == "" {
+			if err != nil {
+				t.Errorf("%s: %v", in, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err=%v want %q", in, err, want)
+		}
+	}
+}
+
+func TestRulesFor_Groups(t *testing.T) {
+	c, err := Parse([]byte(`symbols: [BTCUSDT]
+channels: {tg: {type: telegram}}
+auto_symbols: {}
+rules:
+  - {id: all, symbols: all, interval: 1h, when: "close > 1", channels: [tg]}
+  - {id: manual, symbols: manual, interval: 1h, when: "close > 1", channels: [tg]}
+  - {id: auto, symbols: auto, interval: 1h, when: "close > 1", channels: [tg]}
+  - {id: mixed, symbols: [auto, BTCUSDT], interval: 1h, when: "close > 1", channels: [tg]}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Symbols, c.Auto = []string{"BTCUSDT", "WIFUSDT"}, []string{"WIFUSDT"}
+	idsOf := func(sym string) string {
+		var out []string
+		for _, r := range c.RulesFor(sym) {
+			out = append(out, r.ID)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := idsOf("BTCUSDT"); got != "all,manual,mixed" {
+		t.Errorf("manual symbol rules %q", got)
+	}
+	if got := idsOf("WIFUSDT"); got != "all,auto,mixed" {
+		t.Errorf("auto symbol rules %q", got)
+	}
+}

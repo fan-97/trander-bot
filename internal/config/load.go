@@ -28,6 +28,7 @@ type rawConfig struct {
 	Symbols   []string              `yaml:"symbols"`
 	Intervals []string              `yaml:"intervals"`
 	Rules     []rawRule             `yaml:"rules"`
+	Auto      *rawAuto              `yaml:"auto_symbols"`
 	Channels  map[string]rawChannel `yaml:"channels"`
 	Notify    rawNotify             `yaml:"notify"`
 	Database  struct {
@@ -50,6 +51,77 @@ type rawRule struct {
 	Level    string      `yaml:"level"`
 	Targets  *rawTargets `yaml:"targets"`
 	Setup    *rawSetup   `yaml:"setup"`
+}
+
+type rawAuto struct {
+	Enabled        *bool    `yaml:"enabled"` // default true when the section is present
+	Top            int      `yaml:"top"`
+	RankBy         string   `yaml:"rank_by"`
+	Days           int      `yaml:"days"`
+	BaseDays       int      `yaml:"base_days"`
+	MinQuoteVolume *float64 `yaml:"min_quote_volume"`
+	MinListingDays *int     `yaml:"min_listing_days"`
+	KeepRank       int      `yaml:"keep_rank"`
+	Refresh        string   `yaml:"refresh"`
+	Exclude        []string `yaml:"exclude"`
+}
+
+// auto_symbols defaults.
+const (
+	defaultAutoTop            = 20
+	defaultAutoDays           = 7
+	defaultAutoBaseDays       = 30
+	defaultAutoMinQuoteVolume = 20e6
+	defaultAutoMinListingDays = 30
+	defaultAutoRefresh        = 6 * time.Hour
+)
+
+// DefaultAutoSymbols returns an enabled auto_symbols with every default.
+func DefaultAutoSymbols() *AutoSymbols {
+	a, _ := (&rawAuto{}).build()
+	return a
+}
+
+func (a *rawAuto) build() (*AutoSymbols, error) {
+	out := &AutoSymbols{
+		Enabled: a.Enabled == nil || *a.Enabled,
+		Top:     a.Top, RankBy: RankBy(a.RankBy), Days: a.Days, BaseDays: a.BaseDays, KeepRank: a.KeepRank,
+		MinQuoteVolume: defaultAutoMinQuoteVolume, MinListingDays: defaultAutoMinListingDays, Refresh: defaultAutoRefresh,
+	}
+	if out.Top == 0 {
+		out.Top = defaultAutoTop
+	}
+	if out.RankBy == "" {
+		out.RankBy = RankVolumeGrowth
+	}
+	if out.Days == 0 {
+		out.Days = defaultAutoDays
+	}
+	if out.BaseDays == 0 {
+		out.BaseDays = defaultAutoBaseDays
+	}
+	if out.KeepRank == 0 {
+		out.KeepRank = out.Top + out.Top/2
+	}
+	if a.MinQuoteVolume != nil {
+		out.MinQuoteVolume = *a.MinQuoteVolume
+	}
+	if a.MinListingDays != nil {
+		out.MinListingDays = *a.MinListingDays
+	}
+	for _, s := range a.Exclude {
+		if s = strings.ToUpper(strings.TrimSpace(s)); s != "" && !slices.Contains(out.Exclude, s) {
+			out.Exclude = append(out.Exclude, s)
+		}
+	}
+	if a.Refresh != "" {
+		d, err := time.ParseDuration(a.Refresh)
+		if err != nil {
+			return out, fmt.Errorf("auto_symbols.refresh: invalid duration %q: %w", a.Refresh, err)
+		}
+		out.Refresh = d
+	}
+	return out, nil
 }
 
 type rawSetup struct {
@@ -155,6 +227,14 @@ func (r *rawConfig) build() (*Config, error) {
 		Database: DatabaseConfig{DSN: expandEnv(r.Database.DSN, &missing)},
 		Binance:  BinanceConfig{RESTURL: r.Binance.RESTURL, WSURL: r.Binance.WSURL},
 	}
+	var errs []error
+	if r.Auto != nil {
+		a, err := r.Auto.build()
+		if err != nil {
+			errs = append(errs, err)
+		}
+		c.AutoSymbols = a
+	}
 	if c.Binance.RESTURL == "" {
 		c.Binance.RESTURL = defaultRESTURL
 	}
@@ -170,7 +250,6 @@ func (r *rawConfig) build() (*Config, error) {
 		c.Channels[name] = ChannelConfig{Type: ch.Type, Fallback: ch.Fallback, Params: params}
 	}
 
-	var errs []error
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		errs = append(errs, fmt.Errorf("environment variables not set: %s", strings.Join(missing, ", ")))
@@ -334,8 +413,9 @@ func (r Rule) UsedIntervals() []market.Interval {
 func (c *Config) RulesFor(symbol string) []Rule {
 	var out []Rule
 	for _, r := range c.Rules {
+		auto := slices.Contains(c.Auto, symbol)
 		for _, s := range r.Symbols {
-			if s == AllSymbols || s == symbol {
+			if s == symbol || s == AllSymbols || (s == ManualSymbols && !auto) || (s == AutoSymbolsGroup && auto) {
 				out = append(out, r)
 				break
 			}

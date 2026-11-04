@@ -41,7 +41,7 @@ channels:
 		t.Fatal(err)
 	}
 	have := map[string]bool{"BTCUSDT": true, "ETHUSDT": true}
-	got, dropped := filterSymbols(cfg, have)
+	got, dropped := filterSymbols(cfg, have, nil)
 	if !reflect.DeepEqual(got.Symbols, []string{"BTCUSDT", "ETHUSDT"}) {
 		t.Errorf("symbols = %v", got.Symbols)
 	}
