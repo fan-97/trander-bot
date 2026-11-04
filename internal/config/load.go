@@ -42,6 +42,7 @@ type rawConfig struct {
 
 type rawRule struct {
 	ID       string      `yaml:"id"`
+	Enabled  *bool       `yaml:"enabled"`
 	Symbols  stringList  `yaml:"symbols"`
 	Interval string      `yaml:"interval"`
 	Trigger  string      `yaml:"trigger"`
@@ -257,6 +258,7 @@ func (r *rawConfig) build() (*Config, error) {
 	for i, rr := range r.Rules {
 		r2 := Rule{
 			ID:       rr.ID,
+			Disabled: rr.Enabled != nil && !*rr.Enabled,
 			Symbols:  []string(rr.Symbols),
 			Interval: market.Interval(rr.Interval),
 			Trigger:  Trigger(rr.Trigger),
@@ -409,11 +411,14 @@ func (r Rule) UsedIntervals() []market.Interval {
 	return out
 }
 
-// RulesFor returns the rules that apply to symbol.
+// RulesFor returns the enabled rules that apply to symbol.
 func (c *Config) RulesFor(symbol string) []Rule {
 	var out []Rule
+	auto := slices.Contains(c.Auto, symbol)
 	for _, r := range c.Rules {
-		auto := slices.Contains(c.Auto, symbol)
+		if r.Disabled {
+			continue
+		}
 		for _, s := range r.Symbols {
 			if s == symbol || s == AllSymbols || (s == ManualSymbols && !auto) || (s == AutoSymbolsGroup && auto) {
 				out = append(out, r)

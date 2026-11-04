@@ -68,6 +68,7 @@ type Config struct {
 
 type Rule struct {
 	ID       string
+	Disabled bool     // rules[].enabled: false — validated but never evaluated
 	Symbols  []string // ["all"] means every watched symbol
 	Interval market.Interval
 	Trigger  Trigger
@@ -119,11 +120,11 @@ const (
 // and ATR: long stop = price - Stop*ATR, take = price + k*ATR (short mirrored).
 // They are informational only and never affect whether a rule fires.
 type Targets struct {
-	Side     Side
-	ATR      int             // ATR period
-	Interval market.Interval // interval the ATR is computed on
-	Stop     float64         // ATR multiple; 0: no stop
-	Take     []float64       // ATR multiples
+	Side     Side            `json:"side"`
+	ATR      int             `json:"atr"`      // ATR period
+	Interval market.Interval `json:"interval"` // interval the ATR is computed on
+	Stop     float64         `json:"stop"`     // ATR multiple; 0: no stop
+	Take     []float64       `json:"take"`     // ATR multiples
 }
 
 // AutoSymbols periodically adds the top-ranked USDT perpetuals to the watch

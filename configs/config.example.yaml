@@ -11,6 +11,7 @@ symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
 
 rules:
   - id: pump_with_volume
+    enabled: true           # rule switch: false keeps it validated but never evaluated
     symbols: all            # or an explicit list
     interval: 5m
     trigger: on_close       # on_close (default, candle-close confirmed) | realtime

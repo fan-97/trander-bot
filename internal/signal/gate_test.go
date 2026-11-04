@@ -221,3 +221,17 @@ func TestGate_ResetEdgeKeepsCooldown(t *testing.T) {
 		t.Fatal("did not fire after cooldown")
 	}
 }
+
+func TestGate_LastFired(t *testing.T) {
+	g, clk := newGate()
+	g.Observe("r", "BTC", rule.True, time.Hour)
+	clk.Advance(time.Minute)
+	g.Observe("r", "BTC", rule.False, time.Hour)
+	g.Observe("r", "BTC", rule.True, time.Hour) // inside cooldown: not a fire
+	g.Observe("r", "ETH", rule.False, time.Hour)
+	g.Observe("other", "BTC", rule.True, time.Hour)
+	got := g.LastFired("r")
+	if len(got) != 1 || !got["BTC"].Equal(t0) {
+		t.Fatalf("got %v", got)
+	}
+}

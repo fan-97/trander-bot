@@ -17,7 +17,7 @@ P1 **不下单**、没有 Web 后台、没有 Telegram 命令（这些在 P2 及
 - 系统异常也会推送：WS 断开超过 1 分钟、某个币数据停更 1 分钟、启动 2 分钟仍未连上 WS、配置热加载失败、落库丢数据、
   配置里有不存在的币种、某个币预热失败、启动失败或运行中组件出错导致退出（退出前最多等 5 秒把告警发出去）。
 - 配置文件修改后自动热加载（无需重启），非法配置会被拒绝并告警，继续使用旧配置。
-- `/healthz` 和 `/metrics`（Prometheus）。
+- `/healthz`、`/metrics`（Prometheus）和 `/status`（当前监控的币种、规则开关和状态）。
 
 ## 配置
 
@@ -37,6 +37,7 @@ cp configs/config.example.yaml configs/config.yaml
 | `symbols` | 是* | – | 监控的币种池，如 `[BTCUSDT, ETHUSDT]`。启动时会和交易所的 U 本位永续列表核对，不存在或不在交易的币会被忽略并发一条系统告警。 |
 | `intervals` | 否 | 规则用到的周期 | 需要聚合/预热的周期：`1m` `5m` `15m` `1h` `4h` `1d`。写了的话，每条规则的 `interval`、`@` 引用的周期（含 `setup` 里的）和 `targets.interval` 都必须在列表里。不写时自动包含这些周期，启动时都会通过 REST 预热 500 根。 |
 | `rules[].id` | 是 | – | 规则名，唯一，会出现在通知里。 |
+| `rules[].enabled` | 否 | `true` | 规则开关。`false` 时规则仍会做配置校验，但不评估、不推送；改完保存即热加载生效。 |
 | `rules[].symbols` | 否 | `all` | `all`（整个币种池，含自动币种）、`manual`（只对手动币种）、`auto`（只对自动币种）或币种列表（必须在 `symbols` 里），可以混写，如 `[auto, BTCUSDT]`。 |
 | `auto_symbols` | 否 | 不开启 | 自动选币，见“自动选币 `auto_symbols`”。 |
 | `rules[].interval` | 是 | – | 规则在哪个周期上评估。 |
@@ -375,13 +376,30 @@ curl -i localhost:8080/healthz
 参数：
 
 - `-config`：配置文件路径（默认 `configs/config.yaml`），文件所在目录会被监听用于热加载。
-- `-http`：`/healthz`、`/metrics` 的监听地址（默认 `:8080`）。
+- `-http`：`/healthz`、`/metrics`、`/status` 的监听地址（默认 `:8080`）。
+- `-rank`：打印 `auto_symbols` 的当前排名后退出，不启动机器人（见“自动选币”）。
 - `-healthcheck`：请求 `-http` 地址上的 `/healthz`，返回 200 时退出码 0，否则 1（给容器健康检查用）。
 - `-no-db`（隐藏参数，仅用于本地冒烟测试）：不连数据库，所有落库数据直接丢弃。
 
 数据库迁移在启动时自动执行。`SIGINT` / `SIGTERM` 触发优雅退出，10 秒内没退完会强制退出（退出码 1）。
 
 `/healthz`：启动中（WS 还没连上过）返回 503 `starting`；断线或有币种停更返回 503 `degraded`；正常 200 `ok`。
+
+`/status`：返回当前运行状态的 JSON（只读，仅 GET）：
+
+```sh
+curl -s localhost:8080/status
+curl -s localhost:8080/status | jq '.symbols'                               # 手动 / 自动币种
+curl -s localhost:8080/status | jq '.rules[] | {id, enabled, applies_to}'   # 规则开关和作用的币
+```
+
+- `symbols`：`total`、`manual`（手动）、`auto`（自动选币加入的）。
+- `auto_symbols`：未开启时为 `null`；否则包括排名方式、上次 / 下次选币时间、上次失败原因，以及每个已选币的名次、得分、量增倍数、日均成交额、涨跌幅；`kept` 表示靠 `keep_rank` 保留的币。
+- `rules`：配置里的每条规则（包括 `enabled: false` 的），含开关、周期、触发方式、冷却、渠道、配置的 `symbols`、
+  当前实际作用的币（`applies_to`）、条件（`when`、`setup`）、`targets`，以及每个币最近一次触发的时间（`last_fired`）。
+  冷却中被抑制的不算触发；状态只在内存里，重启后清空。
+- `feeds`：每个币最近一次收到行情的时间和距今秒数。
+- 时间按 `notify.tz` 时区显示。端口默认只绑定本机，`/status` 没有鉴权，不要直接暴露到公网。
 
 `/metrics` 主要指标：`traderbot_ws_connected`、`traderbot_symbols_stale`、`traderbot_symbol_last_event_seconds{symbol}`、
 `traderbot_router_backpressure_total`、`traderbot_writer_dropped_total`、`traderbot_dispatcher_dropped_total{channel}`。
