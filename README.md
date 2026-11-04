@@ -34,10 +34,11 @@ cp configs/config.example.yaml configs/config.yaml
 
 | 键 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `symbols` | 是 | – | 监控的币种池，如 `[BTCUSDT, ETHUSDT]`。启动时会和交易所的 U 本位永续列表核对，不存在或不在交易的币会被忽略并发一条系统告警。 |
+| `symbols` | 是* | – | 监控的币种池，如 `[BTCUSDT, ETHUSDT]`。启动时会和交易所的 U 本位永续列表核对，不存在或不在交易的币会被忽略并发一条系统告警。 |
 | `intervals` | 否 | 规则用到的周期 | 需要聚合/预热的周期：`1m` `5m` `15m` `1h` `4h` `1d`。写了的话，每条规则的 `interval`、`@` 引用的周期（含 `setup` 里的）和 `targets.interval` 都必须在列表里。不写时自动包含这些周期，启动时都会通过 REST 预热 500 根。 |
 | `rules[].id` | 是 | – | 规则名，唯一，会出现在通知里。 |
-| `rules[].symbols` | 否 | `all` | `all`（整个币种池）或币种列表（必须在 `symbols` 里）。 |
+| `rules[].symbols` | 否 | `all` | `all`（整个币种池，含自动币种）、`manual`（只对手动币种）、`auto`（只对自动币种）或币种列表（必须在 `symbols` 里），可以混写，如 `[auto, BTCUSDT]`。 |
+| `auto_symbols` | 否 | 不开启 | 自动选币，见“自动选币 `auto_symbols`”。 |
 | `rules[].interval` | 是 | – | 规则在哪个周期上评估。 |
 | `rules[].trigger` | 否 | `on_close` | `on_close`：K 线收盘后评估；`realtime`：每次 1m 推送都用未收盘的 K 线评估（见下面的限制）。 |
 | `rules[].when` | 是 | – | 条件树，见“规则语法”。 |
@@ -257,6 +258,56 @@ K 线指标（在规则的 `interval` 上按收盘 K 线计算；加 `@周期` �
   - 盘中 `highest(n)` / `lowest(n)` = 前 n 根**已收盘** K 线的最高 / 最低价，不含正在走的这根，整根 K 线期间不变；
     所以 `close > highest(20)` 就是“当前价突破前 20 根高点”的盘中突破。
   - 盘中 `volume_ratio(n)` = 这根 K 线**到目前为止**的成交量 ÷ 前 n 根已收盘 K 线的均量。刚开盘时累计量还小，所以这个条件偏严，只有真正放量才成立。
+
+## 自动选币 `auto_symbols`
+
+定期从币安 U 本位永续里挑出最近几天“排名靠前”的币，加入监控；**手动写在 `symbols` 里的币不受影响**，永远不会被自动移除。
+自动币种只在内存里，不会改写 `config.yaml`；`symbols` 可以留空，只靠自动选币（上表 `symbols` 的 * 即指此）。
+
+```yaml
+auto_symbols:
+  enabled: true               # 写了这一节默认就是 true
+  top: 20                     # 自动加入多少个（不含手动币种）
+  rank_by: volume_growth      # volume_growth | quote_volume | abs_change | gain
+  days: 7                     # 按最近几天排名（已收盘的日线）
+  base_days: 30               # volume_growth 的对比基准：再往前的天数
+  min_quote_volume: 20000000  # 最近 days 天日均成交额下限（USDT）
+  min_listing_days: 30        # 上线至少多少天
+  keep_rank: 30               # 已选中的币排名掉到这个名次以外才移除，默认 top × 1.5
+  refresh: 6h                 # 多久重新选一次（最少 10m）
+  exclude: [XXXUSDT]          # 永远不选的币
+```
+
+筛选步骤：
+
+1. **硬条件**：U 本位永续、交易中、标的是币（排除 BTCDOM 等指数合约）、不是稳定币或黄金代币（USDC、FDUSD、PAXG、XAUT 等）、
+   不在 `exclude` 里、不是手动币种、上线满 `min_listing_days` 天。
+2. **24h 成交额粗筛**：一次请求拿全部币的 24h 成交额，低于 `min_quote_volume` 的直接跳过，省 REST 权重。
+3. **日线打分**：剩下的每个币取 `days + base_days` 根日线，并要求最近 `days` 天日均成交额 ≥ `min_quote_volume`。打分方式：
+   - `volume_growth`（默认）：最近 `days` 天日均成交额 ÷ 之前 `base_days` 天日均，找“突然变热”的币。
+     基准期数据不足一半的币（刚上线不久）不参与这种排名。小币基准很低时倍数可能上百，嫌太激进就调高 `min_quote_volume`。
+   - `quote_volume`：最近 `days` 天日均成交额，最稳定，基本是大币。
+   - `abs_change`：最近 `days` 天涨跌幅的绝对值，涨跌都算。
+   - `gain`：最近 `days` 天涨幅，只看涨。
+4. **取前 `top` 个，防抖**：上次已选中的币只要还在前 `keep_rank` 名就保留，避免在边界上反复加入、移除
+   （每次加入都要预热，每次移除都会清掉该币的冷却和 `setup` 状态）。
+
+运行时：
+
+- 启动时先选一次。选币失败时：有手动币种就先只监控手动币种，10 分钟后重试；没有手动币种就按启动重试流程重试，仍失败则退出。
+- 之后每 `refresh` 重选一次；热加载时 `auto_symbols` 这一节变了会立即重选，改成 `enabled: false` 会立即移除全部自动币种。
+- 自动币种有变化时推送一条“自动币种更新”系统消息，列出新增（名次、量增倍数、日均成交额、涨跌幅）和移除（原因）的币。
+- 新加入的币会像热加载新增币种一样自动订阅 WebSocket 并预热历史 K 线；移除的币停止监控。
+
+调参时可以先看排名，不启动机器人（只调用币安公开行情接口）：
+
+```sh
+go run ./cmd/traderbot -config configs/config.yaml -rank
+# 或在容器里：
+docker compose -f deploy/docker-compose.yml run --rm --no-deps traderbot -config /app/configs/config.yaml -rank
+```
+
+没写 `auto_symbols` 时 `-rank` 按默认参数排名。输出包括名次、得分、量增倍数、日均成交额、涨跌幅和是否会被选中。
 
 ## 防刷屏
 

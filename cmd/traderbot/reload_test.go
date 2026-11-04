@@ -39,6 +39,7 @@ func mustParse(t *testing.T, symbols, threshold string) *config.Config {
 type reloadHarness struct {
 	raw, store *config.Store
 	changed    chan struct{}
+	auto       chan []string
 	mon        *health.Monitor
 	mu         sync.Mutex
 	alerts     []notify.Message
@@ -76,13 +77,13 @@ func (h *reloadHarness) applied() int {
 func startReload(t *testing.T, initial *config.Config) *reloadHarness {
 	t.Helper()
 	have := map[string]bool{"BTCUSDT": true, "ETHUSDT": true}
-	h := &reloadHarness{changed: make(chan struct{}, 1)}
+	h := &reloadHarness{changed: make(chan struct{}, 1), auto: make(chan []string)}
 	h.mon = health.NewMonitor(clock.NewFake(time.Unix(0, 0)), func(m notify.Message) {
 		h.mu.Lock()
 		h.alerts = append(h.alerts, m)
 		h.mu.Unlock()
 	}, time.Minute)
-	active, _ := filterSymbols(initial, have)
+	active, _ := filterSymbols(initial, have, nil)
 	h.raw, h.store = config.NewStore(initial), config.NewStore(active)
 	h.mon.SetSymbols(active.Symbols)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,7 +92,7 @@ func startReload(t *testing.T, initial *config.Config) *reloadHarness {
 	sub := h.raw.Subscribe()
 	go func() {
 		defer close(done)
-		reloadLoop(ctx, sub, h.store, refresh, have, h.mon, h.changed, slog.Default())
+		reloadLoop(ctx, sub, h.auto, initial, h.store, refresh, have, h.mon, h.changed, slog.Default())
 	}()
 	t.Cleanup(func() { cancel(); <-done })
 	return h
@@ -254,5 +255,56 @@ channels:
 	}
 	if h.applied() != 1 {
 		t.Errorf("配置已生效 sent %d times, want 1", h.applied())
+	}
+}
+
+// sendAuto hands an auto selection to the loop and waits until it is applied.
+func (h *reloadHarness) sendAuto(t *testing.T, auto []string) {
+	t.Helper()
+	before := h.store.Current()
+	h.auto <- auto
+	deadline := time.Now().Add(2 * time.Second)
+	for h.store.Current() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("auto selection not applied")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestReloadLoop_AutoSymbolsMergeWithManual(t *testing.T) {
+	h := startReload(t, mustParse(t, "[btcusdt]", "1"))
+	h.sendAuto(t, []string{"ETHUSDT"})
+	got := h.store.Current()
+	if !reflect.DeepEqual(got.Symbols, []string{"BTCUSDT", "ETHUSDT"}) || !reflect.DeepEqual(got.Auto, []string{"ETHUSDT"}) {
+		t.Fatalf("pool %v auto %v", got.Symbols, got.Auto)
+	}
+	if !h.changedFired() {
+		t.Error("stream not resubscribed for the auto symbol")
+	}
+	if h.applied() != 0 {
+		t.Error("an auto update must not announce 配置已生效")
+	}
+	if !reflect.DeepEqual(symbolsTracked(h.mon), []string{"BTCUSDT", "ETHUSDT"}) {
+		t.Errorf("health tracks %v", symbolsTracked(h.mon))
+	}
+
+	// A manual edit keeps the auto symbols.
+	h.publish(t, mustParse(t, "[btcusdt]", "2"))
+	if got := h.store.Current(); !reflect.DeepEqual(got.Auto, []string{"ETHUSDT"}) || len(got.Symbols) != 2 {
+		t.Fatalf("after manual edit: pool %v auto %v", got.Symbols, got.Auto)
+	}
+
+	// Dropping every auto symbol never touches the manual ones.
+	h.sendAuto(t, nil)
+	if got := h.store.Current(); !reflect.DeepEqual(got.Symbols, []string{"BTCUSDT"}) || len(got.Auto) != 0 {
+		t.Fatalf("after auto cleared: pool %v auto %v", got.Symbols, got.Auto)
+	}
+
+	// A symbol added by hand that is also auto-selected counts as manual.
+	h.publish(t, mustParse(t, "[btcusdt, ethusdt]", "2"))
+	h.sendAuto(t, []string{"ETHUSDT"})
+	if got := h.store.Current(); len(got.Symbols) != 2 || len(got.Auto) != 0 {
+		t.Fatalf("manual+auto overlap: pool %v auto %v", got.Symbols, got.Auto)
 	}
 }

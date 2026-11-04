@@ -265,22 +265,83 @@ func (r *REST) getOnce(ctx context.Context, path string, q url.Values, weight in
 
 // Symbols returns the tradable USDT-margined perpetual contracts.
 func (r *REST) Symbols(ctx context.Context) (map[string]bool, error) {
+	cs, err := r.Contracts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(cs))
+	for _, c := range cs {
+		out[c.Symbol] = true
+	}
+	return out, nil
+}
+
+// Contract is a tradable USDT perpetual from exchangeInfo.
+type Contract struct {
+	Symbol         string
+	BaseAsset      string
+	UnderlyingType string    // COIN, INDEX, ...
+	OnboardDate    time.Time // listing time; zero if unknown
+}
+
+// Contracts returns the USDT perpetuals currently trading (weight 1).
+func (r *REST) Contracts(ctx context.Context) ([]Contract, error) {
 	var info struct {
 		Symbols []struct {
-			Symbol       string `json:"symbol"`
-			ContractType string `json:"contractType"`
-			QuoteAsset   string `json:"quoteAsset"`
-			Status       string `json:"status"`
+			Symbol         string `json:"symbol"`
+			ContractType   string `json:"contractType"`
+			QuoteAsset     string `json:"quoteAsset"`
+			Status         string `json:"status"`
+			BaseAsset      string `json:"baseAsset"`
+			UnderlyingType string `json:"underlyingType"`
+			OnboardDate    int64  `json:"onboardDate"`
 		} `json:"symbols"`
 	}
 	if err := r.get(ctx, "/fapi/v1/exchangeInfo", nil, 1, &info); err != nil {
 		return nil, err
 	}
-	out := make(map[string]bool)
+	var out []Contract
 	for _, s := range info.Symbols {
-		if s.ContractType == "PERPETUAL" && s.QuoteAsset == "USDT" && s.Status == "TRADING" {
-			out[s.Symbol] = true
+		if s.ContractType != "PERPETUAL" || s.QuoteAsset != "USDT" || s.Status != "TRADING" {
+			continue
 		}
+		c := Contract{Symbol: s.Symbol, BaseAsset: s.BaseAsset, UnderlyingType: s.UnderlyingType}
+		if s.OnboardDate > 0 {
+			c.OnboardDate = time.UnixMilli(s.OnboardDate).UTC()
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// Ticker24h is one symbol's rolling 24h statistics.
+type Ticker24h struct {
+	Symbol      string
+	QuoteVolume float64 // USDT
+	ChangePct   float64
+}
+
+// Tickers24h returns 24h statistics for every symbol (weight 40).
+func (r *REST) Tickers24h(ctx context.Context) ([]Ticker24h, error) {
+	var rows []struct {
+		Symbol             string          `json:"symbol"`
+		QuoteVolume        json.RawMessage `json:"quoteVolume"`
+		PriceChangePercent json.RawMessage `json:"priceChangePercent"`
+	}
+	if err := r.get(ctx, "/fapi/v1/ticker/24hr", nil, 40, &rows); err != nil {
+		return nil, err
+	}
+	out := make([]Ticker24h, 0, len(rows))
+	for _, row := range rows {
+		qv, err := rawFloat(row.QuoteVolume)
+		if err != nil {
+			return nil, fmt.Errorf("binance: ticker %s quoteVolume: %w", row.Symbol, err)
+		}
+		cp, err := rawFloat(row.PriceChangePercent)
+		if err != nil {
+			return nil, fmt.Errorf("binance: ticker %s priceChangePercent: %w", row.Symbol, err)
+		}
+		out = append(out, Ticker24h{Symbol: row.Symbol, QuoteVolume: qv, ChangePct: cp})
 	}
 	return out, nil
 }

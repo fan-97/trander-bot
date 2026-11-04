@@ -36,17 +36,32 @@ const (
 	TriggerRealtime Trigger = "realtime"
 )
 
-// AllSymbols in a rule's Symbols means every symbol in the watch pool.
-const AllSymbols = "all"
+// Group keywords in a rule's Symbols: AllSymbols is every symbol in the watch
+// pool, ManualSymbols those listed under symbols, AutoSymbolsGroup those added
+// by auto_symbols.
+const (
+	AllSymbols       = "all"
+	ManualSymbols    = "manual"
+	AutoSymbolsGroup = "auto"
+)
+
+// IsSymbolGroup reports whether s is a group keyword rather than a symbol.
+func IsSymbolGroup(s string) bool {
+	return s == AllSymbols || s == ManualSymbols || s == AutoSymbolsGroup
+}
 
 type Config struct {
-	Symbols   []string
-	Intervals []market.Interval
-	Rules     []Rule
-	Channels  map[string]ChannelConfig
-	Notify    NotifyConfig
-	Database  DatabaseConfig
-	Binance   BinanceConfig
+	// Symbols is the watch pool. As loaded it holds the manual symbols; the
+	// running config also includes the auto-selected ones, listed in Auto.
+	Symbols     []string
+	Auto        []string     // auto-selected members of Symbols (runtime only)
+	AutoSymbols *AutoSymbols // nil: auto selection off
+	Intervals   []market.Interval
+	Rules       []Rule
+	Channels    map[string]ChannelConfig
+	Notify      NotifyConfig
+	Database    DatabaseConfig
+	Binance     BinanceConfig
 
 	explicitIntervals bool // Intervals came from YAML, not derived from rules
 }
@@ -110,6 +125,30 @@ type Targets struct {
 	Stop     float64         // ATR multiple; 0: no stop
 	Take     []float64       // ATR multiples
 }
+
+// AutoSymbols periodically adds the top-ranked USDT perpetuals to the watch
+// pool, alongside (never replacing) the manual symbols.
+type AutoSymbols struct {
+	Enabled        bool
+	Top            int
+	RankBy         RankBy
+	Days           int     // ranking window, in closed daily bars
+	BaseDays       int     // volume_growth baseline window before Days
+	MinQuoteVolume float64 // minimum average daily quote volume (USDT) over Days
+	MinListingDays int
+	KeepRank       int // an already-selected symbol stays while ranked within this
+	Refresh        time.Duration
+	Exclude        []string // upper-cased symbols never selected
+}
+
+type RankBy string
+
+const (
+	RankVolumeGrowth RankBy = "volume_growth"
+	RankQuoteVolume  RankBy = "quote_volume"
+	RankAbsChange    RankBy = "abs_change"
+	RankGain         RankBy = "gain"
+)
 
 type ChannelConfig struct {
 	Type     string // telegram|discord|webhook|email|wecom|dingtalk|feishu

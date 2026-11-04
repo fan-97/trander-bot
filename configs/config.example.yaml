@@ -1,4 +1,12 @@
 symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+# Optional: also watch the top-ranked perpetuals of the last days (manual
+# symbols above are never removed). Preview with: traderbot -config ... -rank
+# auto_symbols:
+#   top: 20
+#   rank_by: volume_growth      # volume_growth | quote_volume | abs_change | gain
+#   days: 7
+#   min_quote_volume: 20000000  # average daily USDT volume
+#   refresh: 6h
 # intervals: [5m, 1h, 4h]   # optional; defaults to the intervals rules use (incl. @ and targets)
 
 rules:

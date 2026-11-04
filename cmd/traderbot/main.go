@@ -136,6 +136,7 @@ func main() {
 	cfgPath := fs.String("config", "configs/config.yaml", "path to the YAML config (hot reloaded)")
 	httpAddr := fs.String("http", ":8080", "listen address for /healthz and /metrics")
 	healthcheck := fs.Bool("healthcheck", false, "GET /healthz on the -http address and exit 0 if it returns 200, else 1")
+	rank := fs.Bool("rank", false, "print the auto_symbols ranking for -config (read-only Binance REST calls) and exit")
 	noDB := fs.Bool("no-db", false, "") // hidden: discard all writes (local smoke tests only)
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage of %s:\n", os.Args[0])
@@ -151,6 +152,13 @@ func main() {
 
 	if *healthcheck {
 		os.Exit(probe(*httpAddr))
+	}
+	if *rank {
+		if err := printRank(context.Background(), *cfgPath, os.Stdout); err != nil {
+			slog.Error("rank", "err", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	ctx, stop := ossignal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -238,7 +246,29 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	}); err != nil {
 		return fatal(fmt.Errorf("load exchange symbols: %w", err))
 	}
-	active, dropped := filterSymbols(cfg, have)
+	var auto []string
+	autoRan := false
+	if autoOn(cfg) {
+		pick := func() (err error) {
+			auto, _, err = selectAuto(ctx, rest, cfg, nil, clk.Now())
+			return err
+		}
+		if len(cfg.Symbols) == 0 {
+			// Nothing to watch without it: retry like the other startup calls.
+			if err := retryStartup(ctx, waits, disp, "自动选币", log, pick); err != nil {
+				return fatal(fmt.Errorf("auto_symbols: %w", err))
+			}
+			autoRan = true
+		} else if err := pick(); err != nil {
+			log.Warn("auto_symbols: startup selection failed, starting with the manual symbols only", "err", err)
+			disp.SendSystem(notify.Message{Title: "自动选币失败", Level: config.LevelWarn,
+				Lines: []string{"先只监控手动币种，" + autoRetryAfter.String() + " 内重试", err.Error()}})
+		} else {
+			autoRan = true
+		}
+		log.Info("auto_symbols selected", "symbols", auto)
+	}
+	active, dropped := filterSymbols(cfg, have, auto)
 	if len(active.Symbols) == 0 {
 		return fatal(fmt.Errorf("none of the configured symbols %v is a tradable USDT perpetual", cfg.Symbols))
 	}
@@ -326,10 +356,15 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		})
 	})
 	// Subscribe before starting the loop so a reload published in between is not missed.
-	rawSub := raw.Subscribe()
+	rawSub, autoSub := raw.Subscribe(), raw.Subscribe()
+	autoCh := make(chan []string)
 	g.Go(func() error {
 		refresh := func(ctx context.Context) (map[string]bool, error) { return exchangeSymbols(ctx, rest) }
-		reloadLoop(gctx, rawSub, store, refresh, have, mon, changed, log)
+		reloadLoop(gctx, rawSub, autoCh, cfg, store, refresh, have, mon, changed, log)
+		return nil
+	})
+	g.Go(func() error {
+		autoLoop(gctx, clk, rest, raw, autoSub, auto, autoRan, autoCh, mon.Alert, log)
 		return nil
 	})
 	g.Go(func() error { return ignoreCancel(stream.Run(gctx, symbols, changed, events)) })
@@ -380,7 +415,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		return nil
 	})
 
-	log.Info("traderbot started", "symbols", active.Symbols, "intervals", active.Intervals,
+	log.Info("traderbot started", "symbols", active.Symbols, "auto", active.Auto, "intervals", active.Intervals,
 		"rules", len(active.Rules), "channels", len(active.Channels), "http", ln.Addr().String())
 	// Doubles as a channel self-test, and explains any signal right after a restart.
 	disp.SendSystem(startedMessage(active))
@@ -438,16 +473,24 @@ func exchangeSymbols(ctx context.Context, rest *binance.REST) (map[string]bool, 
 
 // filterSymbols returns a copy of c whose watch pool holds only symbols in
 // have (upper-cased, de-duplicated) and whose rule symbol lists are
-// upper-cased to match, plus the dropped symbols. c is not modified.
-func filterSymbols(c *config.Config, have map[string]bool) (*config.Config, []string) {
+// upper-cased to match, plus the dropped manual symbols. The auto-selected
+// symbols in have that are not manual are appended to the pool and listed in
+// Auto; a symbol that is both stays manual. c is not modified.
+func filterSymbols(c *config.Config, have map[string]bool, auto []string) (*config.Config, []string) {
 	ok, dropped := binance.ValidateSymbols(c.Symbols, have)
 	out := *c
-	out.Symbols = ok
+	out.Symbols, out.Auto = ok, nil
+	for _, s := range auto {
+		if have[s] && !slices.Contains(out.Symbols, s) {
+			out.Symbols = append(out.Symbols, s)
+			out.Auto = append(out.Auto, s)
+		}
+	}
 	out.Rules = make([]config.Rule, len(c.Rules))
 	for i, r := range c.Rules {
 		syms := make([]string, len(r.Symbols))
 		for j, s := range r.Symbols {
-			if s == config.AllSymbols {
+			if config.IsSymbolGroup(s) {
 				syms[j] = s
 			} else {
 				syms[j] = strings.ToUpper(strings.TrimSpace(s))
@@ -464,6 +507,27 @@ func droppedMessage(dropped []string) notify.Message {
 		Lines: []string{"以下币种不是可交易的 U 本位永续合约，已忽略: " + strings.Join(dropped, ", ")}}
 }
 
+// manualOf returns the manual members of the running pool c.
+func manualOf(c *config.Config) []string {
+	var out []string
+	for _, s := range c.Symbols {
+		if !slices.Contains(c.Auto, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func autoList(c *config.Config) string {
+	switch {
+	case !autoOn(c):
+		return "未开启"
+	case len(c.Auto) == 0:
+		return "暂无"
+	}
+	return strings.Join(c.Auto, ", ")
+}
+
 // startedMessage is sent once to every channel at startup.
 func startedMessage(c *config.Config) notify.Message {
 	chans := make([]string, 0, len(c.Channels))
@@ -472,34 +536,43 @@ func startedMessage(c *config.Config) notify.Message {
 	}
 	sort.Strings(chans)
 	return notify.Message{Title: "traderbot 已启动", Level: config.LevelInfo, Lines: []string{
-		"币种: " + strings.Join(c.Symbols, ", "),
+		"币种: " + strings.Join(manualOf(c), ", "),
+		"自动币种: " + autoList(c),
 		fmt.Sprintf("规则: %d 条", len(c.Rules)),
 		"通知渠道: " + strings.Join(chans, ", "),
 		"收到这条说明该渠道可用；重启前已满足的条件不会重复推送。",
 	}}
 }
 
-// reloadLoop applies each config published by config.Watch: it re-validates
-// the symbols, publishes the result to store, resubscribes the stream and
-// updates the health monitor when the pool changed. Notification channels,
+// reloadLoop applies each config published by config.Watch, and each auto
+// selection from autoLoop merged into the last such config (raw is the one
+// loaded at startup): it re-validates the symbols, publishes the result to
+// store, resubscribes the stream and updates the health monitor when the
+// pool changed. Manual symbols are never removed by an auto selection. Notification channels,
 // the database DSN and the Binance URLs are fixed at startup: a change to
 // them is logged and takes effect only after a restart.
-func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.Store, refresh func(context.Context) (map[string]bool, error), have map[string]bool,
+func reloadLoop(ctx context.Context, sub <-chan *config.Config, autoIn <-chan []string, raw *config.Config, store *config.Store,
+	refresh func(context.Context) (map[string]bool, error), have map[string]bool,
 	mon *health.Monitor, changed chan<- struct{}, log *slog.Logger) {
 	running := store.Current().Channels // the dispatcher was built from these and never changes
+	auto := store.Current().Auto
 	for {
 		var c *config.Config
+		fromAuto := false
 		select {
 		case <-ctx.Done():
 			return
 		case c = <-sub:
+			raw = c
+		case auto = <-autoIn:
+			c, fromAuto = raw, true
 		}
 		if fresh, err := refresh(ctx); err == nil {
 			have = fresh
 		} else if ctx.Err() == nil {
 			log.Warn("config reload: exchangeInfo failed, validating symbols against the cached list", "err", err)
 		}
-		next, dropped := filterSymbols(c, have)
+		next, dropped := filterSymbols(c, have, auto)
 		if len(next.Symbols) == 0 {
 			log.Error("config reload: no tradable symbol left, keeping the previous config", "symbols", c.Symbols)
 			mon.Alert(invalidConfigMessage("热加载后的配置中没有可交易的币种，继续使用旧配置"))
@@ -512,7 +585,7 @@ func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.St
 			mon.Alert(invalidConfigMessage("规则引用了未启动的通知渠道（新增渠道需要重启）: " + strings.Join(missing, ", ") + "，继续使用旧配置"))
 			continue
 		}
-		if len(dropped) > 0 {
+		if len(dropped) > 0 && !fromAuto {
 			log.Warn("config reload: ignoring symbols that are not tradable USDT perpetuals", "dropped", dropped)
 			mon.Alert(droppedMessage(dropped)) // rate-limited: reloads can be frequent
 		}
@@ -534,6 +607,10 @@ func reloadLoop(ctx context.Context, sub <-chan *config.Config, store *config.St
 			case changed <- struct{}{}:
 			default:
 			}
+		}
+		if fromAuto {
+			log.Info("auto symbols applied", "symbols", next.Symbols, "auto", next.Auto)
+			continue // autoLoop already announced the change
 		}
 		log.Info("config reloaded", "symbols", next.Symbols, "rules", len(next.Rules))
 		mon.Alert(notify.Message{Title: "配置已生效", Level: config.LevelInfo,
