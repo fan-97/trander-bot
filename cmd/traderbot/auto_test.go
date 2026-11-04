@@ -95,9 +95,10 @@ func TestAutoLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	sub := raw.Subscribe()
+	st := &autoState{}
 	go func() {
 		defer close(done)
-		autoLoop(ctx, clk, src, raw, sub, nil, false, out, alert, slog.Default())
+		autoLoop(ctx, clk, src, raw, sub, nil, false, out, st, alert, slog.Default())
 	}()
 	t.Cleanup(func() { cancel(); <-done })
 
@@ -122,6 +123,9 @@ func TestAutoLoop(t *testing.T) {
 	if got := recv(false); !reflect.DeepEqual(got, []string{"AUSDT"}) {
 		t.Fatalf("first selection %v", got)
 	}
+	if snap := st.snapshot(); len(snap.Rows) != 1 || snap.Rows[0].Symbol != "AUSDT" || !snap.NextRun.Equal(snap.LastRun.Add(time.Hour)) {
+		t.Errorf("state %+v", snap)
+	}
 	mu.Lock()
 	if len(titles) != 1 || !strings.Contains(titles[0], "自动币种更新") || !strings.Contains(titles[0], "+AUSDT #1 量增 ×3.00") {
 		t.Errorf("alerts %q", titles)
@@ -138,6 +142,9 @@ func TestAutoLoop(t *testing.T) {
 	raw.Set(autoCfg(t, false))
 	if got := recv(false); len(got) != 0 {
 		t.Fatalf("disabled selection %v", got)
+	}
+	if snap := st.snapshot(); len(snap.Rows) != 0 || !snap.LastRun.IsZero() {
+		t.Errorf("state after disable %+v", snap)
 	}
 	mu.Lock()
 	if last := titles[len(titles)-1]; !strings.Contains(last, "自动选币已关闭") || !strings.Contains(last, "BUSDT") {

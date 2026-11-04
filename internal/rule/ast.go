@@ -158,3 +158,35 @@ func Funcs(ns ...Node) []Operand {
 	}
 	return out
 }
+
+// String renders the leaf as written, e.g. "rsi(14) < 30" or
+// "cross_up(ema(12), ema(26))".
+func (l Leaf) String() string {
+	if l.Op == OpCrossUp || l.Op == OpCrossDown {
+		return string(l.Op) + "(" + l.Left.String() + ", " + l.Right.String() + ")"
+	}
+	return l.Left.String() + " " + string(l.Op) + " " + l.Right.String()
+}
+
+// Format renders n on one line: leaves as written, groups as
+// "all(a; b)", "any(a; b)" and "not(a)". Nil renders as "".
+func Format(n Node) string {
+	group := func(name string, kids []Node) string {
+		parts := make([]string, len(kids))
+		for i, k := range kids {
+			parts[i] = Format(k)
+		}
+		return name + "(" + strings.Join(parts, "; ") + ")"
+	}
+	switch v := n.(type) {
+	case Leaf:
+		return v.String()
+	case All:
+		return group("all", v.Children)
+	case Any:
+		return group("any", v.Children)
+	case Not:
+		return "not(" + Format(v.Child) + ")"
+	}
+	return ""
+}

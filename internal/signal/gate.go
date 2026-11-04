@@ -118,6 +118,20 @@ func (g *Gate) Prime(ruleID, symbol string, r rule.Result) {
 	s.last = r == rule.True
 }
 
+// LastFired returns, per symbol, when ruleID last fired (cooldown-suppressed
+// edges do not count); symbols that never fired are absent.
+func (g *Gate) LastFired(ruleID string) map[string]time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[string]time.Time{}
+	for k, s := range g.st {
+		if k.rule == ruleID && s.fired {
+			out[k.symbol] = s.lastFired
+		}
+	}
+	return out
+}
+
 // ResetEdge clears the edge state of (ruleID, symbol) but keeps its cooldown,
 // so a rule edited on reload re-arms without bypassing the cooldown.
 func (g *Gate) ResetEdge(ruleID, symbol string) {

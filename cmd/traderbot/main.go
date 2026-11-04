@@ -248,10 +248,17 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	}
 	var auto []string
 	autoRan := false
+	autoSt := &autoState{}
 	if autoOn(cfg) {
-		pick := func() (err error) {
-			auto, _, err = selectAuto(ctx, rest, cfg, nil, clk.Now())
-			return err
+		pick := func() error {
+			sel, rows, err := selectAuto(ctx, rest, cfg, nil, clk.Now())
+			if err != nil {
+				autoSt.failed(err, clk.Now().Add(autoRetryAfter))
+				return err
+			}
+			auto = sel
+			autoSt.ran(clk.Now(), clk.Now().Add(cfg.AutoSymbols.Refresh), rows)
+			return nil
 		}
 		if len(cfg.Symbols) == 0 {
 			// Nothing to watch without it: retry like the other startup calls.
@@ -323,7 +330,8 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		}
 	}
 	warmAlert := batchWarmupAlerts(gctx, clk, warmupAlertWindow, mon.Alert)
-	router := engine.NewRouter(store, signal.NewGate(clk), signals, clk,
+	gate := signal.NewGate(clk)
+	router := engine.NewRouter(store, gate, signals, clk,
 		warmup(rest, stream, store, clk, warmAlert, persistWarmup, log))
 	batcher := signal.NewBatcher(clk, func() config.NotifyConfig { return store.Current().Notify }, batches,
 		func(s signal.Signal) { // every signal, delivered or suppressed, is persisted
@@ -347,7 +355,10 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 	if err != nil {
 		return fatal(fmt.Errorf("http listen: %w", err))
 	}
-	srv := &http.Server{Handler: mon.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	mux := http.NewServeMux()
+	mux.Handle("/", mon.Handler()) // /healthz, /metrics
+	mux.Handle("/status", statusHandler(store, autoSt, gate, mon, clk))
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	g.Go(func() error {
 		return config.Watch(gctx, cfgPath, raw, func(err error) {
@@ -364,7 +375,7 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		return nil
 	})
 	g.Go(func() error {
-		autoLoop(gctx, clk, rest, raw, autoSub, auto, autoRan, autoCh, mon.Alert, log)
+		autoLoop(gctx, clk, rest, raw, autoSub, auto, autoRan, autoCh, autoSt, mon.Alert, log)
 		return nil
 	})
 	g.Go(func() error { return ignoreCancel(stream.Run(gctx, symbols, changed, events)) })

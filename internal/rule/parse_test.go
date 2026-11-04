@@ -227,3 +227,24 @@ all:
 		t.Errorf("funcs %v", fs)
 	}
 }
+
+func TestFormat(t *testing.T) {
+	n, err := Parse(mustYAML(t, `
+all:
+  - ema(20)@4h > ema(50)@4h
+  - any:
+      - cross_up(close, ema(20))
+      - funding_rate < -0.0005
+  - not: low <= 3
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "all(ema(20)@4h > ema(50)@4h; any(cross_up(close, ema(20)); funding_rate < -0.0005); not(low <= 3))"
+	if got := Format(n); got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	if Format(nil) != "" {
+		t.Error("nil")
+	}
+}

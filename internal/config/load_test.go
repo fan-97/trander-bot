@@ -405,3 +405,34 @@ rules:
 		t.Errorf("auto symbol rules %q", got)
 	}
 }
+
+func TestRuleEnabledSwitch(t *testing.T) {
+	c, err := Parse([]byte(`symbols: [BTCUSDT]
+channels: {tg: {type: telegram}}
+rules:
+  - {id: on, interval: 1h, when: "close > 1", channels: [tg]}
+  - {id: off, enabled: false, interval: 1h, when: "close > 1", channels: [tg]}
+  - {id: explicit, enabled: true, interval: 1h, when: "close > 1", channels: [tg]}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Rules[0].Disabled || !c.Rules[1].Disabled || c.Rules[2].Disabled {
+		t.Fatalf("disabled flags %v %v %v", c.Rules[0].Disabled, c.Rules[1].Disabled, c.Rules[2].Disabled)
+	}
+	var ids []string
+	for _, r := range c.RulesFor("BTCUSDT") {
+		ids = append(ids, r.ID)
+	}
+	if strings.Join(ids, ",") != "on,explicit" {
+		t.Errorf("RulesFor %v", ids)
+	}
+	// A disabled rule is still validated.
+	_, err = Parse([]byte(`symbols: [BTCUSDT]
+channels: {tg: {type: telegram}}
+rules: [{id: off, enabled: false, interval: 1h, when: "foo(1) > 1", channels: [tg]}]
+`))
+	if err == nil {
+		t.Error("invalid disabled rule accepted")
+	}
+}

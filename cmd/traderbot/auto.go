@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -24,6 +25,64 @@ const (
 	// autoRetryAfter is the wait after a failed selection.
 	autoRetryAfter = 10 * time.Minute
 )
+
+// autoState is what /status reports about auto selection. Methods are safe
+// for concurrent use and on a nil receiver.
+type autoState struct {
+	mu      sync.Mutex
+	lastRun time.Time // last successful selection
+	nextRun time.Time
+	lastErr string
+	rows    []universe.Row // selected symbols' rows, by rank
+}
+
+type autoSnapshot struct {
+	LastRun, NextRun time.Time
+	LastErr          string
+	Rows             []universe.Row
+}
+
+func (a *autoState) snapshot() autoSnapshot {
+	if a == nil {
+		return autoSnapshot{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return autoSnapshot{a.lastRun, a.nextRun, a.lastErr, slices.Clone(a.rows)}
+}
+
+func (a *autoState) ran(at, next time.Time, rows []universe.Row) {
+	if a == nil {
+		return
+	}
+	var sel []universe.Row
+	for _, r := range rows {
+		if r.Selected {
+			sel = append(sel, r)
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastRun, a.nextRun, a.lastErr, a.rows = at, next, "", sel
+}
+
+func (a *autoState) failed(err error, next time.Time) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastErr, a.nextRun = err.Error(), next
+}
+
+func (a *autoState) off() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastRun, a.nextRun, a.lastErr, a.rows = time.Time{}, time.Time{}, "", nil
+}
 
 // manualSymbols returns c's manual watch pool, upper-cased and de-duplicated.
 func manualSymbols(c *config.Config) []string {
@@ -52,11 +111,14 @@ func selectAuto(ctx context.Context, src universe.Source, c *config.Config, prev
 // (if not, the first one runs immediately). Turning auto_symbols off sends an
 // empty selection.
 func autoLoop(ctx context.Context, clk clock.Clock, src universe.Source, raw *config.Store, sub <-chan *config.Config,
-	prev []string, ran bool, out chan<- []string, alert func(notify.Message), log *slog.Logger) {
+	prev []string, ran bool, out chan<- []string, st *autoState, alert func(notify.Message), log *slog.Logger) {
 	cur := raw.Current()
 	next := clk.Now()
 	if ran {
 		next = next.Add(cur.AutoSymbols.Refresh)
+	}
+	if !autoOn(cur) {
+		st.off()
 	}
 	for {
 		var wait <-chan time.Time
@@ -73,6 +135,7 @@ func autoLoop(ctx context.Context, clk clock.Clock, src universe.Source, raw *co
 				continue
 			}
 			if !autoOn(cur) {
+				st.off()
 				if len(prev) > 0 {
 					log.Info("auto_symbols disabled, removing the auto-selected symbols", "symbols", prev)
 					alert(notify.Message{Title: "自动选币已关闭", Level: config.LevelInfo,
@@ -96,9 +159,11 @@ func autoLoop(ctx context.Context, clk clock.Clock, src universe.Source, raw *co
 			alert(notify.Message{Title: "自动选币失败", Level: config.LevelWarn,
 				Lines: []string{"沿用当前自动币种，" + autoRetryAfter.String() + " 后重试", err.Error()}})
 			next = clk.Now().Add(autoRetryAfter)
+			st.failed(err, next)
 			continue
 		}
 		next = clk.Now().Add(cur.AutoSymbols.Refresh)
+		st.ran(clk.Now(), next, rows)
 		if sameSet(sel, prev) {
 			log.Info("auto_symbols selection unchanged", "symbols", sel)
 			continue
