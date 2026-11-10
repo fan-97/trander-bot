@@ -62,6 +62,8 @@ type Config struct {
 	Notify      NotifyConfig
 	Database    DatabaseConfig
 	Binance     BinanceConfig
+	// TelegramAdmin enables managing the symbols from Telegram; nil: off.
+	TelegramAdmin *TelegramAdmin
 
 	explicitIntervals bool // Intervals came from YAML, not derived from rules
 }
@@ -150,6 +152,15 @@ const (
 	RankAbsChange    RankBy = "abs_change"
 	RankGain         RankBy = "gain"
 )
+
+// TelegramAdmin lets the allowed Telegram chats manage the manual symbols
+// through the bot of a telegram channel (inline-keyboard panel and commands).
+// Edits are written back to the config file and hot reloaded.
+type TelegramAdmin struct {
+	Enabled bool
+	Channel string  // name of a telegram channel; its bot token is used
+	Allow   []int64 // chat or user ids allowed to manage; default: the channel's chat_id
+}
 
 type ChannelConfig struct {
 	Type     string // telegram|discord|webhook|email|wecom|dingtalk|feishu

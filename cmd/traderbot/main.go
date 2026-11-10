@@ -38,6 +38,7 @@ import (
 	"trader-bot/internal/notify"
 	"trader-bot/internal/signal"
 	"trader-bot/internal/storage"
+	"trader-bot/internal/tgadmin"
 )
 
 const (
@@ -378,6 +379,20 @@ func run(ctx context.Context, cfgPath, httpAddr string, deps Deps) error {
 		autoLoop(gctx, clk, rest, raw, autoSub, auto, autoRan, autoCh, autoSt, mon.Alert, log)
 		return nil
 	})
+	if ta := cfg.TelegramAdmin; ta != nil && ta.Enabled {
+		ch := cfg.Channels[ta.Channel]
+		admin := newSymbolAdmin(cfgPath, store, have,
+			func(ctx context.Context) (map[string]bool, error) { return exchangeSymbols(ctx, rest) }, log)
+		bot := tgadmin.New(tgadmin.Options{
+			Token: ch.Params["token"], BaseURL: ch.Params["base_url"], HTTP: deps.HTTPClient,
+			Allow: ta.Allow, Backend: admin, Log: log,
+			Alert: func(title, text string) {
+				mon.Alert(notify.Message{Title: title, Level: config.LevelWarn, Lines: []string{text}})
+			},
+		})
+		log.Info("telegram admin enabled", "channel", ta.Channel, "allow", ta.Allow)
+		g.Go(func() error { return bot.Run(gctx) })
+	}
 	g.Go(func() error { return ignoreCancel(stream.Run(gctx, symbols, changed, events)) })
 	g.Go(func() error { return ignoreCancel(binance.PollContract(gctx, rest, symbols, pollEvery, events, clk)) })
 	g.Go(func() error {

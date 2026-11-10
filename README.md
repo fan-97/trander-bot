@@ -3,7 +3,7 @@
 币安 U 本位永续合约的**信号机器人**（P1）：实时接收行情，按 YAML 里写好的规则计算指标、判断条件，
 满足时推送到 Telegram / Discord / 企业微信 / 钉钉 / 飞书 / 邮件 / 通用 Webhook，并把行情和信号落库到 TimescaleDB。
 
-P1 **不下单**、没有 Web 后台、没有 Telegram 命令（这些在 P2 及以后）。
+P1 **不下单**、没有 Web 后台；Telegram 上目前只有监控币种管理面板（见“Telegram 币种管理”），其它命令在 P2 及以后。
 
 ## 它做什么
 
@@ -18,6 +18,7 @@ P1 **不下单**、没有 Web 后台、没有 Telegram 命令（这些在 P2 及
   配置里有不存在的币种、某个币预热失败、启动失败或运行中组件出错导致退出（退出前最多等 5 秒把告警发出去）。
 - 配置文件修改后自动热加载（无需重启），非法配置会被拒绝并告警，继续使用旧配置。
 - `/healthz`、`/metrics`（Prometheus）和 `/status`（当前监控的币种、规则开关和状态）。
+- 可选的 Telegram 币种管理面板：在 Telegram 里点按钮增删监控币种，改动写回配置文件并热加载。
 
 ## 配置
 
@@ -40,6 +41,9 @@ cp configs/config.example.yaml configs/config.yaml
 | `rules[].enabled` | 否 | `true` | 规则开关。`false` 时规则仍会做配置校验，但不评估、不推送；改完保存即热加载生效。 |
 | `rules[].symbols` | 否 | `all` | `all`（整个币种池，含自动币种）、`manual`（只对手动币种）、`auto`（只对自动币种）或币种列表（必须在 `symbols` 里），可以混写，如 `[auto, BTCUSDT]`。 |
 | `auto_symbols` | 否 | 不开启 | 自动选币，见“自动选币 `auto_symbols`”。 |
+| `telegram_admin.channel` | 开启时必填 | – | 在 Telegram 里管理币种用哪个 telegram 渠道的 bot，见“Telegram 币种管理”。 |
+| `telegram_admin.allow` | 否 | 该渠道的 `chat_id` | 允许管理的 chat id / 用户 id 列表（数字，可写 `${VAR}`）。 |
+| `telegram_admin.enabled` | 否 | `true` | 写了这一节默认开启。 |
 | `rules[].interval` | 是 | – | 规则在哪个周期上评估。 |
 | `rules[].trigger` | 否 | `on_close` | `on_close`：K 线收盘后评估；`realtime`：每次 1m 推送都用未收盘的 K 线评估（见下面的限制）。 |
 | `rules[].when` | 是 | – | 条件树，见“规则语法”。 |
@@ -310,6 +314,38 @@ docker compose -f deploy/docker-compose.yml run --rm --no-deps traderbot -config
 
 没写 `auto_symbols` 时 `-rank` 按默认参数排名。输出包括名次、得分、量增倍数、日均成交额、涨跌幅和是否会被选中。
 
+## Telegram 币种管理
+
+在配置里加上这一节，就能直接在 Telegram 里增删**手动**监控币种（`symbols`），带按钮界面：
+
+```yaml
+telegram_admin:
+  channel: telegram          # 用哪个 type: telegram 的渠道的 bot（同一个 token）
+  allow: [123456789]         # 可选：允许操作的 chat id / 用户 id；不写就是该渠道的 chat_id
+```
+
+在允许的聊天里给 bot 发：
+
+| 命令 | 作用 |
+|---|---|
+| `/symbols` | 打开管理面板：列出手动币种和自动币种，每个手动币种一个按钮，点一下→确认即删除；「➕ 添加」后直接发币种；超过 24 个自动分页 |
+| `/add BTC ETHUSDT` | 添加，多个用空格或逗号分隔；没写计价币时自动补 `USDT`（`BTC` → `BTCUSDT`） |
+| `/del SOLUSDT` | 删除 |
+| `/cancel` | 取消待输入的添加 |
+| `/help` | 帮助 |
+
+- **热加载**：修改直接写回 `config.yaml` 的 `symbols` 那一行（改成 `symbols: [A, B, C]` 单行写法，文件其它内容和注释原样保留），
+  然后走正常的配置热加载：校验 → 订阅 WebSocket → 预热历史 K 线，无需重启。面板会等热加载完成后显示「已热加载生效」。
+- 写入前先完整校验新配置，不合法就不写（例如删掉的币还被某条规则的 `symbols` 点名引用，会提示先改规则）；
+  添加时会先查币安，不是可交易的 U 本位永续合约的会被跳过。
+- 自动选币选出的币只读，面板里单独列出；想排除请用 `auto_symbols.exclude`。
+- 只有 `allow` 里的 chat / 用户能操作；其他人发命令会收到“无权限”并附上自己的 chat id，方便配置。群里使用时，
+  把群的 chat id（负数）或你自己的用户 id 加进 `allow`。
+- bot 用 `getUpdates` 长轮询收消息：同一个 bot token 不能设置 webhook，也不能同时被别的程序 `getUpdates`，否则会告警“Telegram 管理面板不可用”。
+  bot 停机期间发的超过 5 分钟的消息会被忽略。
+- `telegram_admin` 本身的修改需要重启才生效。
+- Docker 部署时 `configs/` 需要以可写方式挂载，并且 `config.yaml`（最好连同 `configs/` 目录）对 uid 65532 可写，见下面的部署说明。
+
 ## 防刷屏
 
 1. **边沿触发**：条件从“不满足”变成“满足”才触发一次，持续满足不会重复推送。
@@ -429,8 +465,11 @@ docker compose -f deploy/docker-compose.yml logs -f traderbot
 - 注意：Docker 的健康检查只会把容器标成 unhealthy，**不会自动重启**；需要自动重启请另配 autoheal 之类的工具。
 - `deploy/.env` 既用于 compose 变量替换（数据库账号），也作为 `traderbot` 容器的环境变量（配置里的 `${VAR}`）。
   `DATABASE_URL` 由 compose 根据 `POSTGRES_*` 自动拼好。
-- 挂载的是整个 `configs/` **目录**（只读），而不是单个文件：编辑器保存时通常是“写新文件再改名”，
+- 挂载的是整个 `configs/` **目录**，而不是单个文件：编辑器保存时通常是“写新文件再改名”，
   单文件挂载会一直指向旧文件，热加载就永远不会触发。直接在宿主机上改 `configs/config.yaml` 即可生效。
+- 挂载是可写的，供 Telegram 币种管理把修改写回 `config.yaml`。要用这个功能，需让 uid 65532 能写：
+  `sudo chown 65532 configs configs/config.yaml`（目录可写时用“写临时文件再改名”原子替换；只有文件可写时原地改写）。
+  不用这个功能可以在 compose 里把挂载改回 `:ro`。
 - 镜像基于 `gcr.io/distroless/static:nonroot`，里面没有 shell 和 curl，容器健康检查用 `traderbot -healthcheck`。
 - 容器以 uid **65532**（nonroot）运行：`configs/` 目录和 `config.yaml` 必须对它可读，
   例如 `chmod 755 configs && chmod 644 configs/config.yaml`（`600` 且属主不是 65532 时会启动失败）。
@@ -454,7 +493,7 @@ docker rm -f tb-tsdb
 
 P2 及以后才做：
 
-- Telegram 命令（增删币、暂停规则、查状态）、信号复盘统计；回测、模拟盘、`Strategy` 接口（P3）；下单（P4）；Web 后台（P5）。
+- Telegram 命令（暂停规则、查状态）、信号复盘统计；回测、模拟盘、`Strategy` 接口（P3）；下单（P4）；Web 后台（P5）。
 
 当前版本需要知道的：
 

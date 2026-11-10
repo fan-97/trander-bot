@@ -93,6 +93,17 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if a := c.TelegramAdmin; a != nil && a.Enabled {
+		if ch, ok := c.Channels[a.Channel]; !ok {
+			add("telegram_admin.channel: unknown channel %q", a.Channel)
+		} else if ch.Type != "telegram" {
+			add("telegram_admin.channel: channel %q is %q, want a telegram channel", a.Channel, ch.Type)
+		}
+		if len(a.Allow) == 0 {
+			add("telegram_admin.allow: no allowed chat/user id (set allow, or a numeric chat_id on the channel)")
+		}
+	}
+
 	ids := map[string]bool{}
 	for i, r := range c.Rules {
 		if r.ID == "" {
