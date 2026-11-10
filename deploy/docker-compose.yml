@@ -54,8 +54,11 @@ services:
     # Mount the configs DIRECTORY, not the file: editors save by renaming a new
     # file into place, and a single-file bind mount would keep pointing at the
     # old inode, so hot reload would never see the change.
+    # Writable so telegram_admin can write symbol edits back to config.yaml
+    # (the file, ideally also the directory, must be writable by uid 65532).
+    # Add :ro back if you do not use telegram_admin.
     volumes:
-      - ../configs:/app/configs:ro
+      - ../configs:/app/configs
     command: ["-config", "/app/configs/config.yaml", "-http", ":8080"]
     ports:
       - "127.0.0.1:8080:8080"

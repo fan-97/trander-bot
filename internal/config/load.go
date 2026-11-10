@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,13 @@ type rawConfig struct {
 		RESTURL string `yaml:"rest_url"`
 		WSURL   string `yaml:"ws_url"`
 	} `yaml:"binance"`
+	TelegramAdmin *rawTelegramAdmin `yaml:"telegram_admin"`
+}
+
+type rawTelegramAdmin struct {
+	Enabled *bool    `yaml:"enabled"` // default true when the section is present
+	Channel string   `yaml:"channel"`
+	Allow   []string `yaml:"allow"`
 }
 
 type rawRule struct {
@@ -235,6 +243,30 @@ func (r *rawConfig) build() (*Config, error) {
 			errs = append(errs, err)
 		}
 		c.AutoSymbols = a
+	}
+	if ta := r.TelegramAdmin; ta != nil {
+		a := &TelegramAdmin{Enabled: ta.Enabled == nil || *ta.Enabled, Channel: ta.Channel}
+		allow := ta.Allow
+		if len(allow) == 0 {
+			if ch, ok := r.Channels[ta.Channel]; ok {
+				allow = []string{ch.Params["chat_id"]}
+			}
+		}
+		for _, v := range allow {
+			v = strings.TrimSpace(expandEnv(v, &missing))
+			if v == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("telegram_admin.allow: %q is not a numeric Telegram chat/user id", v))
+				continue
+			}
+			if !slices.Contains(a.Allow, id) {
+				a.Allow = append(a.Allow, id)
+			}
+		}
+		c.TelegramAdmin = a
 	}
 	if c.Binance.RESTURL == "" {
 		c.Binance.RESTURL = defaultRESTURL

@@ -7,6 +7,11 @@ symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
 #   days: 7
 #   min_quote_volume: 20000000  # average daily USDT volume
 #   refresh: 6h
+# Optional: manage the symbols above from Telegram (/symbols panel, /add, /del).
+# Edits are written back to this file and hot reloaded.
+# telegram_admin:
+#   channel: telegram        # a channel of type telegram below; its bot is used
+#   allow: [123456789]       # chat/user ids allowed; default: that channel's chat_id
 # intervals: [5m, 1h, 4h]   # optional; defaults to the intervals rules use (incl. @ and targets)
 
 rules:
